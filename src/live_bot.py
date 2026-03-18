@@ -13,7 +13,7 @@ from typing import Any
 import pandas as pd
 import requests
 
-from .live_config import LiveConfig
+from .live_config import LiveConfig, build_live_config
 from .roostoo_client import RoostooClient
 from .runtime.lead_lag import build_signals
 from .runtime.weekly_vol import prepare_bars
@@ -370,8 +370,10 @@ def run_once(submission: SubmissionConfig, live: LiveConfig) -> BotState:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run the live Roostoo execution bot for the validated 50/50 submission strategy.")
     parser.add_argument("--polling-seconds", type=int, default=60)
-    parser.add_argument("--state-path", type=Path, default=Path("src/state/live_state.json"))
+    parser.add_argument("--state-path", type=Path, default=None)
     parser.add_argument("--live", action="store_true")
+    parser.add_argument("--competition", action="store_true", help="Use competition-specific Roostoo credentials and state path.")
+    parser.add_argument("--reset-state", action="store_true", help="Delete the selected state file before starting.")
     parser.add_argument("--run-once", action="store_true")
     return parser.parse_args()
 
@@ -379,15 +381,22 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     submission = SubmissionConfig()
-    live = LiveConfig(polling_seconds=args.polling_seconds, state_path=args.state_path, live_trading=args.live)
+    live = build_live_config(
+        competition=args.competition,
+        polling_seconds=args.polling_seconds,
+        state_path=args.state_path,
+        live_trading=args.live,
+    )
+    if args.reset_state and live.state_path.exists():
+        live.state_path.unlink()
     if args.run_once:
         state = run_once(submission, live)
-        print(json.dumps(_state_to_dict(state), indent=2))
+        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path), **_state_to_dict(state)}, indent=2))
         return 0
 
     while True:
         state = run_once(submission, live)
-        print(json.dumps(_state_to_dict(state), indent=2))
+        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path), **_state_to_dict(state)}, indent=2))
         time.sleep(live.polling_seconds)
 
 
