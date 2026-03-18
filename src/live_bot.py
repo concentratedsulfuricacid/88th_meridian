@@ -73,6 +73,37 @@ def save_state(path: Path, state: BotState) -> None:
     path.write_text(json.dumps(_state_to_dict(state), indent=2), encoding="utf-8")
 
 
+def append_trade_log(
+    live: LiveConfig,
+    *,
+    sleeve: str,
+    symbol: str,
+    side: str,
+    requested_qty: float,
+    response: dict[str, Any],
+) -> None:
+    """Append one executed order record to the local trade log."""
+    detail = response.get("OrderDetail", {}) if isinstance(response, dict) else {}
+    trade_log_path = live.state_path.parent / "trades.jsonl"
+    trade_log_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "logged_at": pd.Timestamp.utcnow().isoformat(),
+        "mode": live.bot_mode,
+        "sleeve": sleeve,
+        "symbol": symbol,
+        "side": side,
+        "requested_qty": requested_qty,
+        "filled_qty": _filled_quantity(response),
+        "state_path": str(live.state_path),
+        "order_id": detail.get("OrderID") if isinstance(detail, dict) else None,
+        "status": detail.get("Status") if isinstance(detail, dict) else None,
+        "price": detail.get("FilledAverPrice") if isinstance(detail, dict) else None,
+        "response": response,
+    }
+    with trade_log_path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+
+
 def fetch_binance_klines(base_url: str, symbol: str, interval: str, limit: int) -> pd.DataFrame:
     response = requests.get(
         f"{base_url}/api/v3/klines",
@@ -236,7 +267,8 @@ def maybe_trade_weekly_vol(
             free_eth = wallet.get("ETH", {}).get("free", 0.0) + wallet.get("ETH", {}).get("lock", 0.0)
             qty = round_quantity("ETHUSDT", min(free_eth, state.weekly_vol.qty or free_eth), rules, prices)
             if qty > 0.0 and live.live_trading:
-                client.place_market_order(symbol="ETHUSDT", side="SELL", quantity=qty)
+                response = client.place_market_order(symbol="ETHUSDT", side="SELL", quantity=qty)
+                append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="SELL", requested_qty=qty, response=response)
             state.weekly_vol = WeeklyVolState()
 
     if state.last_weekly_bar_time == latest_bar_time:
@@ -267,6 +299,7 @@ def maybe_trade_weekly_vol(
     filled_qty = qty
     if live.live_trading:
         response = client.place_market_order(symbol="ETHUSDT", side="BUY", quantity=qty)
+        append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="BUY", requested_qty=qty, response=response)
         filled_qty = _filled_quantity(response) or qty
     next_bar_time = pd.Timestamp(latest["open_time"]) + pd.Timedelta(hours=4)
     time_exit_bar_time = next_bar_time + pd.Timedelta(hours=4 * weekly_config.max_hold_bars)
@@ -303,7 +336,15 @@ def maybe_trade_lead_lag(
         free_qty = wallet.get(asset, {}).get("free", 0.0) + wallet.get(asset, {}).get("lock", 0.0)
         qty = round_quantity(state.lead_lag.symbol, min(free_qty, state.lead_lag.qty or free_qty), rules, prices)
         if qty > 0.0 and live.live_trading:
-            client.place_market_order(symbol=state.lead_lag.symbol, side="SELL", quantity=qty)
+            response = client.place_market_order(symbol=state.lead_lag.symbol, side="SELL", quantity=qty)
+            append_trade_log(
+                live,
+                sleeve="lead_lag",
+                symbol=state.lead_lag.symbol,
+                side="SELL",
+                requested_qty=qty,
+                response=response,
+            )
         state.lead_lag = LeadLagState()
 
     if state.last_lead_lag_bar_time == latest_bar_time:
@@ -340,6 +381,7 @@ def maybe_trade_lead_lag(
     filled_qty = qty
     if live.live_trading:
         response = client.place_market_order(symbol=best_target, side="BUY", quantity=qty)
+        append_trade_log(live, sleeve="lead_lag", symbol=best_target, side="BUY", requested_qty=qty, response=response)
         filled_qty = _filled_quantity(response) or qty
     exit_bar_time = current_ts + pd.Timedelta(minutes=5 * lead_config.hold_bars)
     state.lead_lag = LeadLagState(

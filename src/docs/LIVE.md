@@ -49,6 +49,21 @@ State is separated by mode by default:
 
 This matters because the bot maintains sleeve state such as open positions, last processed bar timestamps, and expected hold windows. Competition mode should not inherit practice-state assumptions accidentally.
 
+## Operational Visibility
+
+The live package includes read-only inspection helpers:
+
+- `python -m src.check_balance`
+- `python -m src.check_orders`
+
+Both also support `--competition` to switch credential sets without editing code.
+
+In addition, the live bot appends every successfully submitted order to:
+
+- `src/state/trades.jsonl`
+
+This log is append-only and does not alter the existing strategy state schema.
+
 ## Execution Behavior
 
 The live bot intentionally keeps the execution model simple:
