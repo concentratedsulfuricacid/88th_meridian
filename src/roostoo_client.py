@@ -141,6 +141,16 @@ class RoostooClient:
         }
         return self._request("POST", DEFAULT_ENDPOINTS["place_order"], params=payload, signed=True)
 
+    def place_limit_order(self, *, symbol: str, side: str, quantity: float, price: float) -> dict[str, Any]:
+        payload = {
+            "pair": self.normalize_pair(symbol),
+            "side": side.upper(),
+            "type": "LIMIT",
+            "quantity": quantity,
+            "price": price,
+        }
+        return self._request("POST", DEFAULT_ENDPOINTS["place_order"], params=payload, signed=True)
+
     def cancel_order(self, order_id: str) -> dict[str, Any]:
         return self._request("POST", DEFAULT_ENDPOINTS["cancel_order"], params={"order_id": order_id}, signed=True)
 

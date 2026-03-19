@@ -15,13 +15,13 @@ class LeadLagConfig:
     """Configuration for the 5-minute lead-lag sleeve."""
 
     leaders: tuple[str, ...] = ("BTCUSDT", "ETHUSDT", "SOLUSDT")
-    laggers: tuple[str, ...] = ("ADAUSDT", "DOGEUSDT")
+    laggers: tuple[str, ...] = ("FETUSDT",)
     lookback_bars: int = 3
     hold_bars: int = 12
     leader_threshold: float = 0.0045
     gap_threshold: float = 0.003
     beta_min_periods: int = 288
-    fee_rate: float = 0.001
+    fee_rate: float = 0.0005
     max_positions: int = 1
     initial_cash: float = 1.0
 

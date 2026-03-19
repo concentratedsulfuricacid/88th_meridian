@@ -37,17 +37,17 @@ def build_configs(config: SubmissionConfig) -> tuple[WeeklyVolConfig, LeadLagCon
         stop_sigma=1.0,
         take_profit_sigma=1.25,
         max_hold_bars=42,
-        fee_rate=0.001,
+        fee_rate=0.0005,
     )
     lead_lag = LeadLagConfig(
         leaders=("BTCUSDT", "ETHUSDT", "SOLUSDT"),
-        laggers=("ADAUSDT", "DOGEUSDT"),
+        laggers=("FETUSDT",),
         lookback_bars=3,
         hold_bars=12,
         leader_threshold=0.0045,
         gap_threshold=0.003,
         beta_min_periods=288,
-        fee_rate=0.001,
+        fee_rate=0.0005,
         max_positions=1,
     )
     return weekly_vol, lead_lag

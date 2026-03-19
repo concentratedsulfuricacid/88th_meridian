@@ -264,19 +264,24 @@ def maybe_trade_weekly_vol(
     if state.weekly_vol.active:
         current_price = prices.get("ETH/USD", 0.0)
         exit_due = False
-        if current_price and (current_price <= state.weekly_vol.entry_price - weekly_config.stop_sigma * state.weekly_vol.vol_move):
+        exit_limit_price = current_price
+        stop_price = state.weekly_vol.entry_price - weekly_config.stop_sigma * state.weekly_vol.vol_move
+        tp_price = state.weekly_vol.entry_price + weekly_config.take_profit_sigma * state.weekly_vol.vol_move
+        if current_price and current_price <= stop_price:
             exit_due = True
-        if current_price and (current_price >= state.weekly_vol.entry_price + weekly_config.take_profit_sigma * state.weekly_vol.vol_move):
+            exit_limit_price = stop_price
+        elif current_price and current_price >= tp_price:
             exit_due = True
-        if state.weekly_vol.time_exit_bar_time and pd.Timestamp(latest["open_time"]) >= pd.Timestamp(state.weekly_vol.time_exit_bar_time):
+            exit_limit_price = tp_price
+        elif state.weekly_vol.time_exit_bar_time and pd.Timestamp(latest["open_time"]) >= pd.Timestamp(state.weekly_vol.time_exit_bar_time):
             exit_due = True
-        if float(latest["close"]) <= float(latest["ema_slow"]):
+        elif float(latest["close"]) <= float(latest["ema_slow"]):
             exit_due = True
         if exit_due:
             free_eth = wallet.get("ETH", {}).get("free", 0.0) + wallet.get("ETH", {}).get("lock", 0.0)
             qty = round_quantity("ETHUSDT", min(free_eth, state.weekly_vol.qty or free_eth), rules, prices)
             if qty > 0.0 and live.live_trading:
-                response = client.place_market_order(symbol="ETHUSDT", side="SELL", quantity=qty)
+                response = client.place_limit_order(symbol="ETHUSDT", side="SELL", quantity=qty, price=exit_limit_price)
                 append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="SELL", requested_qty=qty, response=response)
                 if _order_succeeded(response):
                     state.weekly_vol = WeeklyVolState()
@@ -310,7 +315,7 @@ def maybe_trade_weekly_vol(
 
     filled_qty = qty
     if live.live_trading:
-        response = client.place_market_order(symbol="ETHUSDT", side="BUY", quantity=qty)
+        response = client.place_limit_order(symbol="ETHUSDT", side="BUY", quantity=qty, price=eth_price)
         append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="BUY", requested_qty=qty, response=response)
         if not _order_succeeded(response):
             return
@@ -350,7 +355,9 @@ def maybe_trade_lead_lag(
         free_qty = wallet.get(asset, {}).get("free", 0.0) + wallet.get(asset, {}).get("lock", 0.0)
         qty = round_quantity(state.lead_lag.symbol, min(free_qty, state.lead_lag.qty or free_qty), rules, prices)
         if qty > 0.0 and live.live_trading:
-            response = client.place_market_order(symbol=state.lead_lag.symbol, side="SELL", quantity=qty)
+            exit_pair = RoostooClient.normalize_pair(state.lead_lag.symbol)
+            exit_price = prices.get(exit_pair, 0.0)
+            response = client.place_limit_order(symbol=state.lead_lag.symbol, side="SELL", quantity=qty, price=exit_price)
             append_trade_log(
                 live,
                 sleeve="lead_lag",
@@ -397,7 +404,7 @@ def maybe_trade_lead_lag(
 
     filled_qty = qty
     if live.live_trading:
-        response = client.place_market_order(symbol=best_target, side="BUY", quantity=qty)
+        response = client.place_limit_order(symbol=best_target, side="BUY", quantity=qty, price=market_price)
         append_trade_log(live, sleeve="lead_lag", symbol=best_target, side="BUY", requested_qty=qty, response=response)
         if not _order_succeeded(response):
             return

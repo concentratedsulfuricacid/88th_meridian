@@ -28,7 +28,7 @@ class WeeklyVolConfig:
     take_profit_sigma: float = 1.25
     max_hold_bars: int = 42
     touch_order_bars: int = 1
-    fee_rate: float = 0.001
+    fee_rate: float = 0.0005
 
 
 def load_bars(folder: Path, symbol: str, bar_rule: str) -> pd.DataFrame:
