@@ -202,6 +202,11 @@ def total_equity_usd(wallet: dict[str, dict[str, float]], prices: dict[str, floa
     return equity
 
 
+def free_usd_balance(wallet: dict[str, dict[str, float]]) -> float:
+    """Return free USD available for new buys."""
+    return float(wallet.get("USD", {}).get("free", 0.0))
+
+
 def exchange_rules(client: RoostooClient) -> dict[str, dict[str, Any]]:
     payload = client.get_exchange_info()
     pairs = payload.get("TradePairs", {}) if isinstance(payload, dict) else {}
@@ -232,6 +237,10 @@ def _filled_quantity(response: dict[str, Any]) -> float:
         except (TypeError, ValueError):
             continue
     return 0.0
+
+
+def _order_succeeded(response: dict[str, Any]) -> bool:
+    return bool(isinstance(response, dict) and response.get("Success"))
 
 
 def maybe_trade_weekly_vol(
@@ -269,7 +278,10 @@ def maybe_trade_weekly_vol(
             if qty > 0.0 and live.live_trading:
                 response = client.place_market_order(symbol="ETHUSDT", side="SELL", quantity=qty)
                 append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="SELL", requested_qty=qty, response=response)
-            state.weekly_vol = WeeklyVolState()
+                if _order_succeeded(response):
+                    state.weekly_vol = WeeklyVolState()
+            else:
+                state.weekly_vol = WeeklyVolState()
 
     if state.last_weekly_bar_time == latest_bar_time:
         return
@@ -288,7 +300,7 @@ def maybe_trade_weekly_vol(
         return
 
     equity = total_equity_usd(wallet, prices)
-    sleeve_usd = equity * 0.5
+    sleeve_usd = min(equity * 0.5, free_usd_balance(wallet) / (1.0 + weekly_config.fee_rate))
     eth_price = prices.get("ETH/USD", 0.0)
     if sleeve_usd <= 0.0 or eth_price <= 0.0:
         return
@@ -300,6 +312,8 @@ def maybe_trade_weekly_vol(
     if live.live_trading:
         response = client.place_market_order(symbol="ETHUSDT", side="BUY", quantity=qty)
         append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="BUY", requested_qty=qty, response=response)
+        if not _order_succeeded(response):
+            return
         filled_qty = _filled_quantity(response) or qty
     next_bar_time = pd.Timestamp(latest["open_time"]) + pd.Timedelta(hours=4)
     time_exit_bar_time = next_bar_time + pd.Timedelta(hours=4 * weekly_config.max_hold_bars)
@@ -345,7 +359,10 @@ def maybe_trade_lead_lag(
                 requested_qty=qty,
                 response=response,
             )
-        state.lead_lag = LeadLagState()
+            if _order_succeeded(response):
+                state.lead_lag = LeadLagState()
+        else:
+            state.lead_lag = LeadLagState()
 
     if state.last_lead_lag_bar_time == latest_bar_time:
         return
@@ -369,7 +386,7 @@ def maybe_trade_lead_lag(
         return
 
     equity = total_equity_usd(wallet, prices)
-    sleeve_usd = equity * 0.5
+    sleeve_usd = min(equity * 0.5, free_usd_balance(wallet) / (1.0 + lead_config.fee_rate))
     pair = RoostooClient.normalize_pair(best_target)
     market_price = prices.get(pair, 0.0)
     if sleeve_usd <= 0.0 or market_price <= 0.0:
@@ -382,6 +399,8 @@ def maybe_trade_lead_lag(
     if live.live_trading:
         response = client.place_market_order(symbol=best_target, side="BUY", quantity=qty)
         append_trade_log(live, sleeve="lead_lag", symbol=best_target, side="BUY", requested_qty=qty, response=response)
+        if not _order_succeeded(response):
+            return
         filled_qty = _filled_quantity(response) or qty
     exit_bar_time = current_ts + pd.Timedelta(minutes=5 * lead_config.hold_bars)
     state.lead_lag = LeadLagState(
