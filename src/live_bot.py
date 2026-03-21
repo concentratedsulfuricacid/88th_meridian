@@ -1,4 +1,18 @@
-"""Live bot for the validated 50/50 submission strategy using Roostoo execution."""
+"""Live bot for the 24h confirmed breakout strategy (Roostoo execution).
+
+Strategy:
+  - 5 symbols in parallel, each with independent state.
+  - Entry: last completed 5m bar closes >= 288-bar rolling high (24h lookback).
+  - Stop/Target: anchored to rolling_high (not entry price).
+  - Stop:   -100 bps below rolling_high.
+  - Target: +300 bps above rolling_high.
+  - Regime gate: skip entry if 5m close <= 20d EMA (computed on 1h bars, span=480).
+  - EOD:    any open position at midnight UTC closes via limit at current price.
+  - Sizing: equal allocation — total equity / number of symbols (20% each).
+
+Usage:
+  python -m src.live_bot [--live] [--competition] [--run-once]
+"""
 
 from __future__ import annotations
 
@@ -15,57 +29,64 @@ import requests
 
 from .live_config import LiveConfig, build_live_config
 from .roostoo_client import RoostooClient
-from .runtime.lead_lag import build_signals
-from .runtime.weekly_vol import prepare_bars
-from .strategy import SubmissionConfig, build_configs
 
+
+# ---------------------------------------------------------------------------
+# Strategy constants
+# ---------------------------------------------------------------------------
+
+BREAKOUT_SYMBOLS: tuple[str, ...] = (
+    "FLOKIUSDT",
+    "DOGEUSDT",
+    "AVAXUSDT",
+    "FETUSDT",
+    "VIRTUALUSDT",
+)
+
+N_BARS: int = 288          # 24h of 5m bars for rolling high lookback
+STOP_BPS: float = 100.0    # stop distance below entry in bps
+TARGET_BPS: float = 300.0  # target distance above entry in bps
+REGIME_EMA_BARS: int = 5760  # 20d EMA on 5m bars — skip entry if close below
+
+
+# ---------------------------------------------------------------------------
+# State
+# ---------------------------------------------------------------------------
 
 @dataclass
-class WeeklyVolState:
+class SymbolState:
     active: bool = False
     entry_price: float = 0.0
-    vol_move: float = 0.0
-    entry_bar_time: str = ""
-    time_exit_bar_time: str = ""
+    stop_price: float = 0.0
+    target_price: float = 0.0
+    entry_day: str = ""          # UTC date of entry, e.g. "2026-03-22"
     qty: float = 0.0
-
-
-@dataclass
-class LeadLagState:
-    active: bool = False
-    symbol: str = ""
-    entry_bar_time: str = ""
-    exit_bar_time: str = ""
-    qty: float = 0.0
+    last_bar_time: str = ""      # open_time of last processed 5m bar (ISO)
+    target_order_id: str = ""    # resting limit sell at target (fires on touch)
 
 
 @dataclass
 class BotState:
-    last_weekly_bar_time: str = ""
-    last_lead_lag_bar_time: str = ""
-    weekly_vol: WeeklyVolState = field(default_factory=WeeklyVolState)
-    lead_lag: LeadLagState = field(default_factory=LeadLagState)
+    symbols: dict[str, SymbolState] = field(default_factory=dict)
+
+    def get(self, symbol: str) -> SymbolState:
+        if symbol not in self.symbols:
+            self.symbols[symbol] = SymbolState()
+        return self.symbols[symbol]
 
 
 def _state_to_dict(state: BotState) -> dict[str, Any]:
-    return {
-        "last_weekly_bar_time": state.last_weekly_bar_time,
-        "last_lead_lag_bar_time": state.last_lead_lag_bar_time,
-        "weekly_vol": asdict(state.weekly_vol),
-        "lead_lag": asdict(state.lead_lag),
-    }
+    return {"symbols": {sym: asdict(s) for sym, s in state.symbols.items()}}
 
 
 def load_state(path: Path) -> BotState:
     if not path.exists():
         return BotState()
     payload = json.loads(path.read_text(encoding="utf-8"))
-    return BotState(
-        last_weekly_bar_time=str(payload.get("last_weekly_bar_time", "")),
-        last_lead_lag_bar_time=str(payload.get("last_lead_lag_bar_time", "")),
-        weekly_vol=WeeklyVolState(**payload.get("weekly_vol", {})),
-        lead_lag=LeadLagState(**payload.get("lead_lag", {})),
-    )
+    state = BotState()
+    for sym, data in payload.get("symbols", {}).items():
+        state.symbols[sym] = SymbolState(**data)
+    return state
 
 
 def save_state(path: Path, state: BotState) -> None:
@@ -76,25 +97,24 @@ def save_state(path: Path, state: BotState) -> None:
 def append_trade_log(
     live: LiveConfig,
     *,
-    sleeve: str,
     symbol: str,
     side: str,
+    reason: str,
     requested_qty: float,
     response: dict[str, Any],
 ) -> None:
-    """Append one executed order record to the local trade log."""
     detail = response.get("OrderDetail", {}) if isinstance(response, dict) else {}
     trade_log_path = live.state_path.parent / "trades.jsonl"
     trade_log_path.parent.mkdir(parents=True, exist_ok=True)
     record = {
         "logged_at": pd.Timestamp.utcnow().isoformat(),
         "mode": live.bot_mode,
-        "sleeve": sleeve,
+        "sleeve": "breakout",
         "symbol": symbol,
         "side": side,
+        "reason": reason,
         "requested_qty": requested_qty,
         "filled_qty": _filled_quantity(response),
-        "state_path": str(live.state_path),
         "order_id": detail.get("OrderID") if isinstance(detail, dict) else None,
         "status": detail.get("Status") if isinstance(detail, dict) else None,
         "price": detail.get("FilledAverPrice") if isinstance(detail, dict) else None,
@@ -103,6 +123,10 @@ def append_trade_log(
     with trade_log_path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(record, separators=(",", ":")) + "\n")
 
+
+# ---------------------------------------------------------------------------
+# Market data
+# ---------------------------------------------------------------------------
 
 def fetch_binance_klines(base_url: str, symbol: str, interval: str, limit: int) -> pd.DataFrame:
     response = requests.get(
@@ -117,58 +141,28 @@ def fetch_binance_klines(base_url: str, symbol: str, interval: str, limit: int) 
     frame = pd.DataFrame(
         raw,
         columns=[
-            "open_time",
-            "open",
-            "high",
-            "low",
-            "close",
-            "volume",
-            "close_time",
-            "quote_asset_volume",
-            "number_of_trades",
-            "taker_buy_base_asset_volume",
-            "taker_buy_quote_asset_volume",
-            "ignore",
+            "open_time", "open", "high", "low", "close", "volume",
+            "close_time", "quote_asset_volume", "number_of_trades",
+            "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
         ],
     )
     frame["open_time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
     frame["close_time"] = pd.to_datetime(frame["close_time"], unit="ms", utc=True)
-    for column in ("open", "high", "low", "close", "volume"):
-        frame[column] = frame[column].astype(float)
+    for col in ("open", "high", "low", "close", "volume"):
+        frame[col] = frame[col].astype(float)
     return frame
 
 
-def load_completed_weekly_bars(base_url: str, symbol: str) -> pd.DataFrame:
-    hourly = fetch_binance_klines(base_url, symbol, "1h", 1000)
+def load_completed_5m_bars(base_url: str, symbol: str, limit: int = 400) -> pd.DataFrame:
+    """Return completed (closed) 5m bars, most recent last."""
+    bars = fetch_binance_klines(base_url, symbol, "5m", limit)
     now = pd.Timestamp.utcnow()
-    completed = hourly.loc[hourly["close_time"] < now].copy()
-    completed["bucket"] = completed["open_time"].dt.floor("4h")
-    counts = completed.groupby("bucket")["open_time"].count()
-    complete_buckets = counts[counts == 4].index
-    grouped = completed.loc[completed["bucket"].isin(complete_buckets)].groupby("bucket")
-    bars = pd.DataFrame(
-        {
-            "open_time": grouped["open_time"].min(),
-            "open": grouped["open"].first(),
-            "high": grouped["high"].max(),
-            "low": grouped["low"].min(),
-            "close": grouped["close"].last(),
-        }
-    ).reset_index(drop=True)
-    return bars
+    return bars.loc[bars["close_time"] < now].copy().reset_index(drop=True)
 
 
-def load_completed_lead_lag_panel(base_url: str, symbols: tuple[str, ...]) -> pd.DataFrame:
-    now = pd.Timestamp.utcnow()
-    panel: pd.DataFrame | None = None
-    for symbol in symbols:
-        frame = fetch_binance_klines(base_url, symbol, "5m", 1000)
-        completed = frame.loc[frame["close_time"] < now, ["open_time", "open", "close"]].copy()
-        completed = completed.rename(columns={"open": f"{symbol}_open", "close": f"{symbol}_close"})
-        panel = completed if panel is None else panel.merge(completed, on="open_time", how="inner")
-    assert panel is not None
-    return panel.sort_values("open_time").reset_index(drop=True)
-
+# ---------------------------------------------------------------------------
+# Roostoo helpers
+# ---------------------------------------------------------------------------
 
 def current_price_map(client: RoostooClient) -> dict[str, float]:
     payload = client.get_ticker()
@@ -179,9 +173,8 @@ def current_price_map(client: RoostooClient) -> dict[str, float]:
     for pair, detail in data.items():
         if not isinstance(detail, dict):
             continue
-        last = detail.get("LastPrice")
         try:
-            out[str(pair)] = float(last)
+            out[str(pair)] = float(detail.get("LastPrice"))
         except (TypeError, ValueError):
             continue
     return out
@@ -203,7 +196,6 @@ def total_equity_usd(wallet: dict[str, dict[str, float]], prices: dict[str, floa
 
 
 def free_usd_balance(wallet: dict[str, dict[str, float]]) -> float:
-    """Return free USD available for new buys."""
     return float(wallet.get("USD", {}).get("free", 0.0))
 
 
@@ -213,7 +205,12 @@ def exchange_rules(client: RoostooClient) -> dict[str, dict[str, Any]]:
     return pairs if isinstance(pairs, dict) else {}
 
 
-def round_quantity(symbol: str, quantity: float, rules: dict[str, dict[str, Any]], prices: dict[str, float]) -> float:
+def round_quantity(
+    symbol: str,
+    quantity: float,
+    rules: dict[str, dict[str, Any]],
+    prices: dict[str, float],
+) -> float:
     pair = RoostooClient.normalize_pair(symbol)
     detail = rules.get(pair, {})
     precision = int(detail.get("AmountPrecision", 6))
@@ -243,212 +240,221 @@ def _order_succeeded(response: dict[str, Any]) -> bool:
     return bool(isinstance(response, dict) and response.get("Success"))
 
 
-def maybe_trade_weekly_vol(
-    submission: SubmissionConfig,
+# ---------------------------------------------------------------------------
+# Strategy — per symbol
+# ---------------------------------------------------------------------------
+
+def _process_symbol(
+    symbol: str,
     live: LiveConfig,
     client: RoostooClient,
     rules: dict[str, dict[str, Any]],
     prices: dict[str, float],
     wallet: dict[str, dict[str, float]],
     state: BotState,
+    equity: float,
 ) -> None:
-    weekly_config, _ = build_configs(submission)
-    bars = load_completed_weekly_bars(live.binance_base_url, weekly_config.symbol)
-    if bars.empty:
-        return
-    prepared = prepare_bars(bars, weekly_config)
-    latest = prepared.iloc[-1]
-    latest_bar_time = pd.Timestamp(latest["open_time"]).isoformat()
+    sym_state = state.get(symbol)
+    pair = RoostooClient.normalize_pair(symbol)
+    current_price = prices.get(pair, 0.0)
+    today_utc = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
 
-    # Intrabar stop/target monitoring using live Roostoo prices.
-    if state.weekly_vol.active:
-        current_price = prices.get("ETH/USD", 0.0)
-        exit_due = False
-        exit_limit_price = current_price
-        stop_price = state.weekly_vol.entry_price - weekly_config.stop_sigma * state.weekly_vol.vol_move
-        tp_price = state.weekly_vol.entry_price + weekly_config.take_profit_sigma * state.weekly_vol.vol_move
-        if current_price and current_price <= stop_price:
-            exit_due = True
-            exit_limit_price = stop_price
-        elif current_price and current_price >= tp_price:
-            exit_due = True
-            exit_limit_price = tp_price
-        elif state.weekly_vol.time_exit_bar_time and pd.Timestamp(latest["open_time"]) >= pd.Timestamp(state.weekly_vol.time_exit_bar_time):
-            exit_due = True
-        elif float(latest["close"]) <= float(latest["ema_slow"]):
-            exit_due = True
-        if exit_due:
-            free_eth = wallet.get("ETH", {}).get("free", 0.0) + wallet.get("ETH", {}).get("lock", 0.0)
-            qty = round_quantity("ETHUSDT", min(free_eth, state.weekly_vol.qty or free_eth), rules, prices)
-            if qty > 0.0 and live.live_trading:
-                response = client.place_limit_order(symbol="ETHUSDT", side="SELL", quantity=qty, price=exit_limit_price)
-                append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="SELL", requested_qty=qty, response=response)
-                if _order_succeeded(response):
-                    state.weekly_vol = WeeklyVolState()
+    # -----------------------------------------------------------------------
+    # Exit logic: check open position before looking at new signals
+    # -----------------------------------------------------------------------
+    if sym_state.active:
+        asset = symbol.replace("USDT", "")
+        asset_balance = float(wallet.get(asset, {}).get("free", 0.0)) + float(wallet.get(asset, {}).get("lock", 0.0))
+        target_already_filled = (
+            sym_state.target_order_id != ""
+            and asset_balance < sym_state.qty * 0.01
+        )
+
+        if target_already_filled:
+            # Resting target limit filled automatically — just clear state
+            sym_state.active = False
+            sym_state.qty = 0.0
+            sym_state.target_order_id = ""
+            return
+
+        exit_price: float | None = None
+        reason = ""
+
+        if current_price > 0.0 and current_price <= sym_state.stop_price:
+            exit_price = current_price   # price already at/below stop — sell at current market
+            reason = "stop"
+        elif sym_state.entry_day and today_utc != sym_state.entry_day:
+            exit_price = current_price if current_price > 0.0 else sym_state.entry_price
+            reason = "eod"
+
+        if exit_price is not None and exit_price > 0.0:
+            # Cancel resting target order first so locked qty is released
+            if sym_state.target_order_id and live.live_trading:
+                client.cancel_order(sym_state.target_order_id)
+                sym_state.target_order_id = ""
+            # Use free + lock in case cancel hasn't settled yet
+            asset_detail = wallet.get(asset, {})
+            total_held = float(asset_detail.get("free", 0.0)) + float(asset_detail.get("lock", 0.0))
+            qty = round_quantity(symbol, min(total_held, sym_state.qty or total_held), rules, prices)
+            if qty > 0.0:
+                if live.live_trading:
+                    # Limit at exit_price: guaranteed to fill on touch (stop price already
+                    # touched since current_price <= stop_price; EOD uses current price)
+                    response = client.place_limit_order(
+                        symbol=symbol, side="SELL", quantity=qty, price=exit_price
+                    )
+                    append_trade_log(
+                        live, symbol=symbol, side="SELL", reason=reason,
+                        requested_qty=qty, response=response,
+                    )
+                    if _order_succeeded(response):
+                        sym_state.active = False
+                        sym_state.qty = 0.0
+                else:
+                    sym_state.active = False
+                    sym_state.qty = 0.0
             else:
-                state.weekly_vol = WeeklyVolState()
+                sym_state.active = False
+                sym_state.qty = 0.0
+        return  # don't look for new entry while in (or just exited) position
 
-    if state.last_weekly_bar_time == latest_bar_time:
-        return
-    state.last_weekly_bar_time = latest_bar_time
-
-    if state.weekly_vol.active:
-        return
-
-    regime = float(latest["close"]) > float(latest["ema_slow"]) and float(latest["ema_fast"]) > float(latest["ema_slow"])
-    vol_move = latest["vol_move"]
-    recent_high = latest["recent_high"]
-    if not regime or pd.isna(vol_move) or pd.isna(recent_high):
-        return
-    pullback = float(recent_high) - float(latest["close"])
-    if pullback < weekly_config.entry_sigma * float(vol_move):
+    # -----------------------------------------------------------------------
+    # Entry logic: 24h confirmed breakout
+    # -----------------------------------------------------------------------
+    try:
+        bars = load_completed_5m_bars(live.binance_base_url, symbol, limit=N_BARS + 50)
+    except Exception:
         return
 
-    equity = total_equity_usd(wallet, prices)
-    sleeve_usd = min(equity * 0.5, free_usd_balance(wallet) / (1.0 + weekly_config.fee_rate))
-    eth_price = prices.get("ETH/USD", 0.0)
-    if sleeve_usd <= 0.0 or eth_price <= 0.0:
+    if len(bars) < N_BARS + 1:
         return
-    qty = round_quantity("ETHUSDT", sleeve_usd / eth_price, rules, prices)
+
+    last_bar = bars.iloc[-1]
+    last_bar_time = pd.Timestamp(last_bar["open_time"]).isoformat()
+
+    # Skip if we already processed this bar
+    if last_bar_time == sym_state.last_bar_time:
+        return
+    sym_state.last_bar_time = last_bar_time
+
+    # Rolling high over prior N_BARS bars (exclude the signal bar itself)
+    prior_bars = bars.iloc[-(N_BARS + 1):-1]
+    rolling_high = float(prior_bars["high"].max())
+
+    # Confirmation: bar close must be >= rolling high (not just a wick)
+    if float(last_bar["close"]) < rolling_high:
+        return
+
+    # Regime gate: skip if close is below 20d EMA.
+    # Use 1h bars (480 bars = 20 days) so the EWM is fully warmed up in one API call.
+    try:
+        htf = fetch_binance_klines(live.binance_base_url, symbol, "1h", 480)
+        htf_completed = htf.loc[htf["close_time"] < pd.Timestamp.utcnow()]
+        ema_20d = float(htf_completed["close"].ewm(span=480, adjust=False).mean().iloc[-1])
+    except Exception:
+        return
+    if float(last_bar["close"]) <= ema_20d:
+        return
+
+    # Signal confirmed — place buy at current market price.
+    # Stop and target are anchored to rolling_high (the backtest entry reference),
+    # not to current_price, so live R:R matches what was backtested.
+    if current_price <= 0.0:
+        return
+
+    allocation_usd = equity / len(BREAKOUT_SYMBOLS)
+    affordable = min(allocation_usd, free_usd_balance(wallet))
+    if affordable <= 0.0:
+        return
+
+    qty = round_quantity(symbol, affordable / current_price, rules, prices)
     if qty <= 0.0:
         return
 
     filled_qty = qty
+    target_order_id = ""
+    # Anchor stop/target to rolling_high, matching the backtest entry reference.
+    stop = rolling_high * (1.0 - STOP_BPS / 10_000.0)
+    target = rolling_high * (1.0 + TARGET_BPS / 10_000.0)
+
     if live.live_trading:
-        response = client.place_limit_order(symbol="ETHUSDT", side="BUY", quantity=qty, price=eth_price)
-        append_trade_log(live, sleeve="weekly_vol", symbol="ETHUSDT", side="BUY", requested_qty=qty, response=response)
-        if not _order_succeeded(response):
+        # Entry: limit at current_price — fills immediately (price is above rolling_high).
+        # Stop and target are anchored to rolling_high to match backtest levels.
+        entry_response = client.place_limit_order(
+            symbol=symbol, side="BUY", quantity=qty, price=current_price
+        )
+        append_trade_log(
+            live, symbol=symbol, side="BUY", reason="breakout",
+            requested_qty=qty, response=entry_response,
+        )
+        if not _order_succeeded(entry_response):
             return
-        filled_qty = _filled_quantity(response) or qty
-    next_bar_time = pd.Timestamp(latest["open_time"]) + pd.Timedelta(hours=4)
-    time_exit_bar_time = next_bar_time + pd.Timedelta(hours=4 * weekly_config.max_hold_bars)
-    state.weekly_vol = WeeklyVolState(
-        active=True,
-        entry_price=eth_price,
-        vol_move=float(vol_move),
-        entry_bar_time=next_bar_time.isoformat(),
-        time_exit_bar_time=time_exit_bar_time.isoformat(),
-        qty=filled_qty,
-    )
+        filled_qty = _filled_quantity(entry_response) or qty
 
-
-def maybe_trade_lead_lag(
-    submission: SubmissionConfig,
-    live: LiveConfig,
-    client: RoostooClient,
-    rules: dict[str, dict[str, Any]],
-    prices: dict[str, float],
-    wallet: dict[str, dict[str, float]],
-    state: BotState,
-) -> None:
-    _, lead_config = build_configs(submission)
-    panel = load_completed_lead_lag_panel(live.binance_base_url, (*lead_config.leaders, *lead_config.laggers))
-    if panel.empty:
-        return
-    latest_bar_time = pd.Timestamp(panel.iloc[-1]["open_time"]).isoformat()
-    leader_return, gaps = build_signals(panel, lead_config)
-    latest_index = len(panel) - 1
-    current_ts = pd.Timestamp(panel.iloc[latest_index]["open_time"])
-
-    if state.lead_lag.active and state.lead_lag.exit_bar_time and current_ts >= pd.Timestamp(state.lead_lag.exit_bar_time):
-        asset = state.lead_lag.symbol.replace("USDT", "")
-        free_qty = wallet.get(asset, {}).get("free", 0.0) + wallet.get(asset, {}).get("lock", 0.0)
-        qty = round_quantity(state.lead_lag.symbol, min(free_qty, state.lead_lag.qty or free_qty), rules, prices)
-        if qty > 0.0 and live.live_trading:
-            exit_pair = RoostooClient.normalize_pair(state.lead_lag.symbol)
-            exit_price = prices.get(exit_pair, 0.0)
-            response = client.place_limit_order(symbol=state.lead_lag.symbol, side="SELL", quantity=qty, price=exit_price)
-            append_trade_log(
-                live,
-                sleeve="lead_lag",
-                symbol=state.lead_lag.symbol,
-                side="SELL",
-                requested_qty=qty,
-                response=response,
+        # Immediately place resting limit sell at target — fires automatically on touch
+        target_qty = round_quantity(symbol, filled_qty, rules, prices)
+        if target_qty > 0.0:
+            target_response = client.place_limit_order(
+                symbol=symbol, side="SELL", quantity=target_qty, price=target
             )
-            if _order_succeeded(response):
-                state.lead_lag = LeadLagState()
-        else:
-            state.lead_lag = LeadLagState()
+            append_trade_log(
+                live, symbol=symbol, side="SELL", reason="target_resting",
+                requested_qty=target_qty, response=target_response,
+            )
+            if _order_succeeded(target_response):
+                detail = target_response.get("OrderDetail", {})
+                target_order_id = str(detail.get("OrderID", "")) if isinstance(detail, dict) else ""
 
-    if state.last_lead_lag_bar_time == latest_bar_time:
-        return
-    state.last_lead_lag_bar_time = latest_bar_time
-
-    if state.lead_lag.active:
-        return
-
-    leader_value = leader_return.iloc[latest_index]
-    if pd.isna(leader_value) or float(leader_value) <= lead_config.leader_threshold:
-        return
-    best_target: str | None = None
-    best_gap = lead_config.gap_threshold
-    for target in lead_config.laggers:
-        gap_value = gaps[target].iloc[latest_index]
-        if pd.isna(gap_value) or float(gap_value) <= best_gap:
-            continue
-        best_gap = float(gap_value)
-        best_target = target
-    if best_target is None:
-        return
-
-    equity = total_equity_usd(wallet, prices)
-    sleeve_usd = min(equity * 0.5, free_usd_balance(wallet) / (1.0 + lead_config.fee_rate))
-    pair = RoostooClient.normalize_pair(best_target)
-    market_price = prices.get(pair, 0.0)
-    if sleeve_usd <= 0.0 or market_price <= 0.0:
-        return
-    qty = round_quantity(best_target, sleeve_usd / market_price, rules, prices)
-    if qty <= 0.0:
-        return
-
-    filled_qty = qty
-    if live.live_trading:
-        response = client.place_limit_order(symbol=best_target, side="BUY", quantity=qty, price=market_price)
-        append_trade_log(live, sleeve="lead_lag", symbol=best_target, side="BUY", requested_qty=qty, response=response)
-        if not _order_succeeded(response):
-            return
-        filled_qty = _filled_quantity(response) or qty
-    exit_bar_time = current_ts + pd.Timedelta(minutes=5 * lead_config.hold_bars)
-    state.lead_lag = LeadLagState(
-        active=True,
-        symbol=best_target,
-        entry_bar_time=current_ts.isoformat(),
-        exit_bar_time=exit_bar_time.isoformat(),
-        qty=filled_qty,
-    )
+    sym_state.active = True
+    sym_state.entry_price = current_price
+    sym_state.stop_price = stop
+    sym_state.target_price = target
+    sym_state.entry_day = today_utc
+    sym_state.qty = filled_qty
+    sym_state.target_order_id = target_order_id
 
 
-def run_once(submission: SubmissionConfig, live: LiveConfig) -> BotState:
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
+
+def run_once(live: LiveConfig) -> BotState:
     client = RoostooClient(live)
     if not client.is_configured():
         raise RuntimeError("Roostoo API credentials are not configured.")
+
     state = load_state(live.state_path)
     rules = exchange_rules(client)
     prices = current_price_map(client)
     wallet = wallet_holdings(client)
-    maybe_trade_weekly_vol(submission, live, client, rules, prices, wallet, state)
-    wallet = wallet_holdings(client)
-    prices = current_price_map(client)
-    maybe_trade_lead_lag(submission, live, client, rules, prices, wallet, state)
+    equity = total_equity_usd(wallet, prices)
+
+    for symbol in BREAKOUT_SYMBOLS:
+        # Refresh wallet between symbols so free balance stays accurate
+        wallet = wallet_holdings(client)
+        _process_symbol(symbol, live, client, rules, prices, wallet, state, equity)
+
     save_state(live.state_path, state)
     return state
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Run the live Roostoo execution bot for the validated 50/50 submission strategy.")
+    parser = argparse.ArgumentParser(
+        description="24h confirmed breakout strategy — Roostoo live execution."
+    )
     parser.add_argument("--polling-seconds", type=int, default=60)
     parser.add_argument("--state-path", type=Path, default=None)
     parser.add_argument("--live", action="store_true")
-    parser.add_argument("--competition", action="store_true", help="Use competition-specific Roostoo credentials and state path.")
-    parser.add_argument("--reset-state", action="store_true", help="Delete the selected state file before starting.")
+    parser.add_argument("--competition", action="store_true",
+                        help="Use competition credentials and state path.")
+    parser.add_argument("--reset-state", action="store_true",
+                        help="Delete the selected state file before starting.")
     parser.add_argument("--run-once", action="store_true")
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
-    submission = SubmissionConfig()
     live = build_live_config(
         competition=args.competition,
         polling_seconds=args.polling_seconds,
@@ -457,14 +463,17 @@ def main() -> int:
     )
     if args.reset_state and live.state_path.exists():
         live.state_path.unlink()
+
     if args.run_once:
-        state = run_once(submission, live)
-        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path), **_state_to_dict(state)}, indent=2))
+        state = run_once(live)
+        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path),
+                          **_state_to_dict(state)}, indent=2))
         return 0
 
     while True:
-        state = run_once(submission, live)
-        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path), **_state_to_dict(state)}, indent=2))
+        state = run_once(live)
+        print(json.dumps({"mode": live.bot_mode, "state_path": str(live.state_path),
+                          **_state_to_dict(state)}, indent=2))
         time.sleep(live.polling_seconds)
 
 
