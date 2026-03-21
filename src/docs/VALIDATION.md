@@ -1,52 +1,107 @@
-# Validation
+# 88th Meridian — Validation
 
-## Walk-Forward Setup
+## Backtest Setup
 
-The locked validation result for the submission uses:
+- **Data:** Binance 5m klines downloaded locally for each symbol
+- **Period:** January 2025 – February 2026 (14 months)
+- **Entry model:** Bar close at or above 288-bar rolling high (confirmed breakout)
+- **Stop/target anchor:** Rolling high at time of signal
+- **Regime gate:** Close > 20d EMA (span=5760 on 5m bars in backtest)
+- **Fees:** 10 bps round-trip (limit orders, 5 bps/side)
+- **Sizing:** Full allocation per position, one trade at a time per symbol
+- **EOD:** Open positions closed at midnight UTC (final bar close)
 
-- portfolio: `50%` `ETHUSDT` weekly-vol sleeve + `50%` `ADAUSDT` / `DOGEUSDT` lead-lag sleeve
-- warmup history before each test window: `90` calendar days
-- test window length: `7` days
-- step size: `7` days
-- independent out-of-sample windows: `47`
+---
 
-This produces a stitched weekly walk-forward evaluation rather than a single in-sample backtest.
+## Configuration Evolution
 
-## Main Result
+Three configurations were tested to understand the true edge:
 
-- stitched out-of-sample return: `+43.71%`
-- mean weekly return: `+0.81%`
-- median weekly return: `+0.30%`
-- positive weeks: `55.32%`
-- weeks with at least one trade: `93.62%`
-- mean trades per week: `4.06`
-- best week: `+9.39%`
-- worst week: `-4.73%`
+### Optimistic (wick entry, rolling high anchor)
+Entry at rolling high price the moment price touches it (wick counts as signal).
 
-These numbers are the locked headline metrics for the packaged submission evaluator.
+- Equal-weight return: **+108%** across 12 symbols
+- Win rate: ~40–45%
+- **Problem:** In live trading the bar has already closed above the rolling high by the
+  time the signal is detected. A limit order at rolling high won't fill. This number
+  is not achievable live.
 
-## Benchmark Comparison
+### Realistic (bar close entry, rolling high anchor) — **selected**
+Entry at bar close price when the 5m bar closes above rolling high. Stop and target
+remain anchored to rolling high.
 
-On the same out-of-sample span:
+- Equal-weight return: **+30.61%** across 5 selected symbols
+- Win rate: 40–44%
+- Mean net P&L: +4.7 to +22.7 bps per trade depending on symbol
+- **This is the configuration the live bot implements.**
 
-- `ETH` buy and hold: `+1.86%`
-- equal-weight buy and hold `ETH + ADA + DOGE`: `-34.30%`
+### With confirmation only, no regime gate
+Adding the confirmation bar filter (bar close) to the wick entry model:
+- Flips strategy from deeply negative (-82%) to strongly positive
+- Regime gate provides additional ~5–10% return improvement in bear periods
 
-The submission outperformed both passive benchmarks on the same walk-forward sample.
+---
+
+## Full-Period Results (Realistic Model, Jan 2025 – Feb 2026)
+
+| Symbol | Return | Trades | Win Rate | Mean Net | Target Rate | Stop Rate | EOD Rate |
+|--------|--------|--------|----------|----------|-------------|-----------|----------|
+| FLOKIUSDT | +56.87% | — | 44% | +22.7 bps | — | — | — |
+| DOGEUSDT | +33.54% | — | 43% | +15.5 bps | — | — | — |
+| AVAXUSDT | +31.90% | — | 40% | +13.8 bps | — | — | — |
+| FETUSDT | +22.87% | — | 40% | +10.3 bps | — | — | — |
+| VIRTUALUSDT | +7.87% | — | 42% | +4.7 bps | — | — | — |
+| **Equal-weight** | **+30.61%** | | | | | | |
+
+---
+
+## Rolling 10-Day Window Analysis
+
+To simulate competition conditions (8-day trading window), 75 rolling 10-day windows
+were tested across the 14-month period.
+
+| Metric | Value |
+|--------|-------|
+| Mean return per window | +1.65% |
+| Median return per window | +0.77% |
+| Worst window | −3.01% |
+| Windows worse than −5% | 0 |
+| Positive windows | majority |
+
+The worst-case drawdown across all tested windows was −3.01%, well within acceptable
+bounds for an 8-day competition.
+
+---
+
+## Why Win Rate Is ~40–44%
+
+A win rate below 50% is expected and correct given the 3:1 R:R structure.
+
+Break-even win rate at 3:1 R:R = **25%**. At 40–44%, the strategy is running well above
+break-even. Mean EV per trade is positive across all five symbols.
+
+The confirmation bar filter is the single most important component — it reduces the
+proportion of false breakouts (wick touches that reverse) without significantly reducing
+signal frequency.
+
+---
+
+## Benchmark
+
+Over the same 14-month period:
+- BTC buy-and-hold: market-dependent, trending down from Oct 2025 peaks
+- The regime gate actively reduces loss periods by skipping entries when close ≤ 20d EMA
+
+---
 
 ## Integrity Notes
 
-The validation write-up is based on the leak-clean version of the strategy:
-
-- the lead-lag beta is causal and shifted by one bar
-- entries are formed on completed bars and executed on the next bar
-- the stronger in-sample touch-entry idea was rejected because it failed the weekly walk-forward test
-
-## Competition Framing
-
-The competition is scored over a short window. That is why the portfolio matters:
-
-- the weekly-vol sleeve contributes stronger directional return when `ETH` is trending
-- the lead-lag sleeve contributes much higher short-window trade presence
-
-The combined portfolio was preferred because it preserved edge while remaining active in most evaluation windows.
+- All entries use the **completed** bar close, not the open of the next bar
+- Rolling high is computed from the **prior** 288 bars, excluding the signal bar
+- Regime EMA is computed on the full historical series (no look-ahead in backtest)
+- No parameter optimisation was performed — parameters were chosen by logic:
+  - 288 bars = exactly 24 hours on 5m data
+  - 100/300 bps = clean 3:1 ratio
+  - 5760 bars = exactly 20 trading days on 5m data
+- Symbol selection was done on the full 14-month period (in-sample) — the main
+  overfitting risk acknowledged in this strategy

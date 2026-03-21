@@ -1,4 +1,4 @@
-"""Live bot for the 24h confirmed breakout strategy (Roostoo execution).
+"""88th Meridian — live execution bot (Roostoo).
 
 Strategy:
   - 5 symbols in parallel, each with independent state.
@@ -109,7 +109,7 @@ def append_trade_log(
     record = {
         "logged_at": pd.Timestamp.utcnow().isoformat(),
         "mode": live.bot_mode,
-        "sleeve": "breakout",
+        "sleeve": "88th_meridian",
         "symbol": symbol,
         "side": side,
         "reason": reason,

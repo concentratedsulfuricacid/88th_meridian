@@ -1,97 +1,116 @@
-# Strategy
+# 88th Meridian — Strategy
 
-## Portfolio Thesis
+## Overview
 
-The submission combines two different sources of edge so that it can still act inside a short competition window:
+Apex is a confirmed intraday breakout strategy executed across five liquid crypto assets
+on the Roostoo spot competition account. It is long-only, spot-only, and targets a
+single source of edge: price breaking above the prior 24-hour high with confirmation,
+in a trending market regime.
 
-- a slower directional sleeve that captures medium-horizon `ETH` trend continuation after volatility-scaled pullbacks
-- a faster relative-value sleeve that captures short-term catch-up moves in liquid alts after the major leaders move first
+The strategy was developed through iterative backtesting after rejecting an asymmetric
+grid approach that was structurally broken due to an inverted risk-reward ratio.
 
-Both sleeves are:
+---
 
-- long-only
-- spot-only
-- designed around a single-exchange execution model
+## What We Rejected First
 
-The portfolio starts in `USDT` and splits capital equally across the two sleeves. If one sleeve is inactive, that capital remains in cash instead of being forced into another position.
+Before landing on Apex, we backtested an asymmetric intraday grid strategy:
 
-## Sleeve 1: ETH Weekly-Volatility Pullback
+- Daily anchor = UTC day open
+- Three limit buy ladders below anchor at -0.5%, -1.0%, -1.5%
+- Pre-paired TP sells at anchor, anchor-0.3%, anchor-0.5%
+- Hard stop at -3.5% from anchor
 
-This sleeve trades `ETHUSDT` on completed `4h` bars built from Binance `1h` spot data.
+**Result: -14.19% equal-weight across 12 symbols, 1/12 positive.**
 
-The core idea is that bullish `ETH` regimes tend to reward controlled pullback entries better than fixed-percentage dip buying. Instead of using a static distance, the strategy scales its pullback threshold, stop, and target using a rolling weekly volatility estimate. That makes the entry distance adaptive to quiet and volatile regimes.
+The reason was structural: TP hits produced ~60 bps profit, but stop hits produced
+~2,700 bps loss. With a 78% TP rate and 20% stop rate, EV per trade was -493 bps.
+No filter or parameter change could fix an inverted R:R.
 
-The regime filter is:
+---
 
-- `close > EMA100`
-- `EMA20 > EMA100`
+## The Apex Edge
 
-Once the regime is bullish, the sleeve computes:
+The core observation: assets that break above their prior 24-hour high with a confirmed
+bar close (not just a wick) tend to continue in that direction intraday.
 
-- weekly volatility from the last `42` completed `4h` returns
-- a recent swing high from the last `5` completed bars
+Breakouts confirmed by a closing price above the rolling high have a materially lower
+false breakout rate than wick-only entries. This single filter — requiring the bar
+**close** to exceed the rolling high — flipped the strategy from deeply negative to
+consistently profitable across the tested universe.
 
-It then waits for price to retrace by at least `0.25 * weekly_vol_move` from that recent high. Entry is at the next `4h` bar open. The exit structure is volatility-scaled as well:
+---
 
-- stop loss at `1.0 * weekly_vol_move` below entry
-- take profit at `1.25 * weekly_vol_move` above entry
-- time stop after `42` bars
-- regime exit if `close <= EMA100`
+## Signal Logic
 
-This sleeve is intentionally simple: trend filter, adaptive pullback threshold, adaptive exits.
+**Timeframe:** 5-minute bars from Binance REST klines.
 
-## Sleeve 2: 5-Minute Lead-Lag
+**Rolling high:** Maximum high across the prior 288 completed bars (24 hours of 5m bars),
+excluding the signal bar itself.
 
-This sleeve uses a leader basket of:
+**Entry condition:** The last completed 5m bar closes at or above the rolling high.
 
-- `BTCUSDT`
-- `ETHUSDT`
-- `SOLUSDT`
+**Regime gate:** Entry is skipped if the asset's close is at or below its 20-day EMA.
+The EMA is computed from 480 × 1h bars (20 days) to ensure full convergence in a single
+API call at runtime. This prevents entries in sustained downtrends.
 
-and trades whichever of these laggers is more attractive:
+---
 
-- `ADAUSDT`
-- `DOGEUSDT`
+## Trade Structure
 
-The idea is that the leaders tend to incorporate new information first, while selected altcoins can lag briefly before catching up. The strategy does not buy alts just because they are up; it buys them when they are still behind their expected move relative to the leader basket.
+All levels are anchored to `rolling_high`, not the entry fill price. This ensures the
+live risk-reward matches what was backtested regardless of entry slippage.
 
-Every `5` minutes, the sleeve computes:
+| Level | Calculation | Value |
+|-------|-------------|-------|
+| Entry | Current market price (limit order at time of signal) | — |
+| Stop | `rolling_high × (1 − 100 bps)` | −1% from rolling high |
+| Target | `rolling_high × (1 + 300 bps)` | +3% from rolling high |
+| EOD exit | Any open position at midnight UTC closes at current price | — |
 
-- leader basket return over the last `3` bars, which is `15m`
-- lagger return over the same `15m`
-- a causal beta estimate between each lagger and the leader basket
+**Risk-reward: 3:1** (target 300 bps, stop 100 bps).
 
-The beta is estimated using expanding covariance and variance, then shifted by one bar so the signal uses only past information. The gap score is:
+---
 
-- `gap = leader_return - beta * lagger_return`
+## Symbol Universe
 
-The sleeve only enters if:
+Five symbols were selected after testing the full 66-asset Roostoo competition universe
+under realistic entry assumptions (bar close entry, rolling high anchored stop/target,
+10 bps round-trip fees, regime gate active).
 
-- leader basket return is greater than `0.45%`
-- lag gap is greater than `0.30%`
+| Symbol | Backtest Return | Win Rate | Mean Net P&L |
+|--------|----------------|----------|--------------|
+| FLOKIUSDT | +56.87% | 44% | +22.7 bps/trade |
+| DOGEUSDT | +33.54% | 43% | +15.5 bps/trade |
+| AVAXUSDT | +31.90% | 40% | +13.8 bps/trade |
+| FETUSDT | +22.87% | 40% | +10.3 bps/trade |
+| VIRTUALUSDT | +7.87% | 42% | +4.7 bps/trade |
 
-If both laggers qualify, it takes the one with the larger gap. Entry is at the next `5m` bar open. Exit is deliberately simple: hold for `12` bars, or `60` minutes, then exit at the next bar open.
+**Equal-weight portfolio: +30.61% over 14 months (Jan 2025 – Feb 2026), 5/5 positive.**
 
-## Why This Combination
+Selection criteria: positive return under the realistic entry model, sufficient trade
+frequency, and confirmed edge with both the confirmation bar filter and regime gate active.
 
-The weekly-vol sleeve and the lead-lag sleeve solve different problems:
-
-- the weekly-vol sleeve gives stronger average return per trade but lower event frequency
-- the lead-lag sleeve gives much better short-window opportunity frequency
-
-Together they create a portfolio that is more suitable for a fixed short competition window than either sleeve on its own.
+---
 
 ## Fee Model
 
-All validation numbers for the current locked submission use:
+All backtest and live numbers use limit orders only.
 
-- `10 bps` round trip
+| Order type | Fee per side | Round-trip |
+|------------|-------------|------------|
+| Limit | 5 bps | 10 bps |
 
-## Live Execution Mapping
+Market orders (20 bps round-trip) were explicitly rejected after verifying that the edge
+does not survive the higher fee load.
 
-The live implementation keeps the same signal logic and maps it into Roostoo spot execution:
+---
 
-- weekly-vol sleeve trades `ETH/USD`
-- lead-lag sleeve trades `ADA/USD` or `DOGE/USD`
-- Binance market data builds the completed bars
-- Roostoo provides balances, ticker snapshots, exchange metadata, and order execution
+## Position Sizing
+
+Capital is split equally across all five symbols: 20% per slot. Allocation is computed
+from total portfolio equity (cash + open positions marked to market) at the start of each
+poll cycle.
+
+One position per symbol at a time. A symbol cannot enter a new trade while it has an
+active position.

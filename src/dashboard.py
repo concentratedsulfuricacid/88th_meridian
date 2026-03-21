@@ -1,4 +1,4 @@
-"""Simple monitoring dashboard for the live breakout bot.
+"""Simple monitoring dashboard for 88th Meridian.
 
 Reads the state file and trades.jsonl written by live_bot.py and serves
 a self-refreshing HTML page on port 8080.
@@ -132,7 +132,7 @@ _HTML = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>88 Street — Bot Dashboard</title>
+<title>88th Meridian</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 24px; }
@@ -165,7 +165,7 @@ _HTML = """<!DOCTYPE html>
 </style>
 </head>
 <body>
-<h1>88 Street — Breakout Bot</h1>
+<h1>88th Meridian</h1>
 <p class="subtitle">Auto-refreshes every 30s &nbsp;·&nbsp; <span id="mode"></span></p>
 
 <div class="grid">
