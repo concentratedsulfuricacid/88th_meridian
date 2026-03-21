@@ -1,34 +1,90 @@
-# Submission Repository
+# 88th Meridian
 
-This repository is intentionally limited to the competition submission package.
+A confirmed intraday breakout strategy built for the Roostoo trading competition.
+Long-only, spot-only, single exchange.
 
-The submission is a two-sleeve long-only crypto strategy designed for short evaluation windows while staying inside the spot-only, one-exchange constraint set.
+---
 
-The portfolio is split equally between:
+## Strategy
 
-- an `ETHUSDT` weekly-volatility pullback sleeve
-- an `ADAUSDT` / `DOGEUSDT` 5-minute lead-lag sleeve
+88th Meridian enters when a 5-minute bar **closes** above the prior 24-hour rolling high,
+with a regime gate that blocks entries in downtrends. Stop and target are anchored to the
+rolling high at signal time — not the entry fill price — preserving a clean 3:1 R:R
+regardless of entry slippage.
 
-The weekly-vol sleeve provides slower directional exposure during bullish `ETH` regimes. The lead-lag sleeve provides higher trade frequency by reacting to short-term moves in a `BTC/ETH/SOL` leader basket when `ADA` or `DOGE` underreact.
+| Parameter | Value |
+|-----------|-------|
+| Lookback | 288 × 5m bars (24 hours) |
+| Confirmation | Bar close ≥ rolling high |
+| Regime gate | Close > 20-day EMA |
+| Stop | −100 bps from rolling high |
+| Target | +300 bps from rolling high |
+| EOD exit | Midnight UTC |
+| Fees | 10 bps round-trip (limit orders) |
 
-The submission code lives in [src](/Users/damianeng/repos/88_street/src), with the main write-up in:
+**Symbols:** FLOKIUSDT · DOGEUSDT · AVAXUSDT · FETUSDT · VIRTUALUSDT
 
-- [src/docs/README.md](/Users/damianeng/repos/88_street/src/docs/README.md)
-- [src/docs/STRATEGY.md](/Users/damianeng/repos/88_street/src/docs/STRATEGY.md)
-- [src/docs/VALIDATION.md](/Users/damianeng/repos/88_street/src/docs/VALIDATION.md)
-- [src/docs/LIVE.md](/Users/damianeng/repos/88_street/src/docs/LIVE.md)
+**Sizing:** Equal weight — 20% per symbol slot.
 
-Main commands:
+---
+
+## Backtest Results
+
+Tested on 14 months of Binance 5m data (Jan 2025 – Feb 2026), realistic bar-close entry model.
+
+| Symbol | Return |
+|--------|--------|
+| FLOKIUSDT | +56.87% |
+| DOGEUSDT | +33.54% |
+| AVAXUSDT | +31.90% |
+| FETUSDT | +22.87% |
+| VIRTUALUSDT | +7.87% |
+| **Equal-weight** | **+30.61%** |
+
+Rolling 10-day window analysis (75 windows): mean +1.65%, median +0.77%, worst −3.01%, zero windows below −5%.
+
+---
+
+## Running the Bot
 
 ```bash
-.venv/bin/python -m src.strategy
-.venv/bin/python -m src.live_bot --run-once
-.venv/bin/python -m src.live_bot --live
+# Install dependencies
+pip install -r src/requirements-live.txt
+
+# Run bot (competition mode, live orders)
+python3 -m src.live_bot --competition --live
+
+# Run monitoring dashboard on port 8080
+python3 -m src.dashboard --competition --port 8080
+
+# Dry run (no orders placed)
+python3 -m src.live_bot --competition --run-once
 ```
 
-The latest validated offline result from the packaged evaluator is:
+---
 
-- stitched out-of-sample return: `+43.71%`
-- mean weekly return: `+0.81%`
-- positive weeks: `55.32%`
-- trade weeks: `93.62%`
+## Deployment (AWS EC2 + SSM)
+
+Run as systemd services so the bot persists after the terminal session closes.
+See [src/docs/LIVE.md](src/docs/LIVE.md) for full systemd setup and EC2 security group configuration.
+
+---
+
+## Docs
+
+- [Strategy](src/docs/STRATEGY.md) — signal logic, symbol selection, what we rejected
+- [Validation](src/docs/VALIDATION.md) — backtest results, rolling windows, integrity notes
+- [Live Execution](src/docs/LIVE.md) — bot architecture, entry/exit flow, deployment
+
+---
+
+## Research
+
+Backtesting code lives in [`codex_spot_lab/`](codex_spot_lab/):
+
+```bash
+# Reproduce the main backtest
+python3 -m codex_spot_lab.breakout_backtest \
+  --symbols FLOKIUSDT DOGEUSDT AVAXUSDT FETUSDT VIRTUALUSDT \
+  --n 288 --stop-bps 100 --target-bps 300 --confirm --regime-ema 5760
+```
