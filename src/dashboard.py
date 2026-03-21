@@ -1,13 +1,12 @@
-"""Simple monitoring dashboard for 88th Meridian.
+"""88th Meridian — local monitoring dashboard.
 
-Reads the state file and trades.jsonl written by live_bot.py and serves
-a self-refreshing HTML page on port 8080.
+Queries Roostoo directly for live balances, prices, and open orders.
+Reads local trades.jsonl for trade history.
 
 Usage:
   python -m src.dashboard [--port 8080] [--competition]
 
-Then open  http://<EC2_PUBLIC_IP>:8080  in any browser.
-EC2: ensure port 8080 is open in the instance's security group (inbound TCP).
+Then open http://localhost:8080 in your browser.
 """
 
 from __future__ import annotations
@@ -16,33 +15,109 @@ import argparse
 import json
 from pathlib import Path
 
+import pandas as pd
+import requests
 from flask import Flask, Response, jsonify
 
+from .live_bot import BREAKOUT_SYMBOLS, N_BARS
 from .live_config import build_live_config
+from .roostoo_client import RoostooClient
 
 app = Flask(__name__)
-_state_path: Path = Path("src/state/competition_live_state.json")
-_trades_path: Path = Path("src/state/trades.jsonl")
+_live_config = None
+
+
+def _client() -> RoostooClient:
+    return RoostooClient(_live_config)
+
 
 # ---------------------------------------------------------------------------
-# Data readers
+# Data helpers
 # ---------------------------------------------------------------------------
 
-def _read_state() -> dict:
-    if not _state_path.exists():
-        return {}
+def _get_portfolio() -> dict:
+    client = _client()
     try:
-        return json.loads(_state_path.read_text(encoding="utf-8"))
+        raw_balances = client.get_balances()
+        wallet = client.wallet_from_balances(raw_balances)
+    except Exception as e:
+        return {"error": str(e)}
+
+    try:
+        ticker = client.get_ticker()
+        prices_raw = ticker.get("Data", {}) or {}
+        prices = {}
+        for pair, detail in prices_raw.items():
+            try:
+                prices[pair] = float(detail.get("LastPrice", 0))
+            except (TypeError, ValueError):
+                pass
     except Exception:
-        return {}
+        prices = {}
+
+    # Compute equity
+    equity = 0.0
+    positions = []
+    for asset, detail in wallet.items():
+        free = float(detail.get("free", 0.0))
+        lock = float(detail.get("lock", 0.0))
+        total = free + lock
+        if asset == "USD":
+            equity += total
+            continue
+        pair = f"{asset}/USD"
+        price = prices.get(pair, 0.0)
+        value = total * price if price > 0 else 0.0
+        equity += value
+        if total > 0:
+            positions.append({
+                "asset": asset,
+                "free": round(free, 6),
+                "lock": round(lock, 6),
+                "total": round(total, 6),
+                "price": price,
+                "value_usd": round(value, 2),
+            })
+
+    return {
+        "equity_usd": round(equity, 2),
+        "usd_free": round(float(wallet.get("USD", {}).get("free", 0.0)), 2),
+        "positions": sorted(positions, key=lambda x: x["value_usd"], reverse=True),
+    }
+
+
+def _get_open_orders() -> list[dict]:
+    client = _client()
+    try:
+        resp = client.query_orders(pending_only=True)
+        orders = resp.get("OrderList") or resp.get("Orders") or []
+        if not isinstance(orders, list):
+            return []
+        out = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            out.append({
+                "order_id": o.get("OrderID", ""),
+                "pair": o.get("Pair", ""),
+                "side": o.get("Side", ""),
+                "type": o.get("Type", ""),
+                "quantity": o.get("Quantity", ""),
+                "price": o.get("Price", ""),
+                "status": o.get("Status", ""),
+            })
+        return out
+    except Exception:
+        return []
 
 
 def _read_trades(limit: int = 200) -> list[dict]:
-    if not _trades_path.exists():
+    trades_path = Path(_live_config.state_path).parent / "trades.jsonl"
+    if not trades_path.exists():
         return []
     lines = []
     try:
-        with _trades_path.open(encoding="utf-8") as fh:
+        with trades_path.open(encoding="utf-8") as fh:
             lines = fh.readlines()
     except Exception:
         return []
@@ -52,42 +127,36 @@ def _read_trades(limit: int = 200) -> list[dict]:
             records.append(json.loads(line))
         except Exception:
             continue
-    return list(reversed(records))  # most recent first
+    return list(reversed(records))
 
 
 def _pnl_summary(trades: list[dict]) -> dict:
-    """Compute simple P&L stats from trade log."""
-    buys: dict[str, dict] = {}   # symbol -> last buy record
-    closed: list[dict] = []
-
-    # Walk chronologically (trades list is reversed, so reverse back)
+    buys: dict[str, dict] = {}
+    closed = []
     for record in reversed(trades):
         sym = record.get("symbol", "")
         side = record.get("side", "")
         reason = record.get("reason", "")
-
         if side == "BUY":
             buys[sym] = record
         elif side == "SELL" and reason != "target_resting":
-            # Actual exit (stop, eod, or target auto-filled)
             buy = buys.pop(sym, None)
             if buy:
                 try:
-                    buy_price = float(buy.get("price") or 0)
-                    sell_price = float(record.get("price") or 0)
-                    if buy_price > 0 and sell_price > 0:
-                        pnl_bps = ((sell_price / buy_price) - 1.0) * 10_000.0
+                    bp = float(buy.get("price") or 0)
+                    sp = float(record.get("price") or 0)
+                    if bp > 0 and sp > 0:
+                        pnl_bps = ((sp / bp) - 1.0) * 10_000.0
                         closed.append({
                             "symbol": sym,
                             "reason": reason,
                             "pnl_bps": round(pnl_bps, 1),
-                            "buy_price": buy_price,
-                            "sell_price": sell_price,
+                            "buy_price": bp,
+                            "sell_price": sp,
                             "logged_at": record.get("logged_at", ""),
                         })
                 except (TypeError, ValueError):
                     pass
-
     wins = [t for t in closed if t["pnl_bps"] > 0]
     return {
         "closed_trades": len(closed),
@@ -101,21 +170,99 @@ def _pnl_summary(trades: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Signal scanner
+# ---------------------------------------------------------------------------
+
+def _fetch_klines(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+    resp = requests.get(
+        f"{_live_config.binance_base_url}/api/v3/klines",
+        params={"symbol": symbol, "interval": interval, "limit": limit},
+        timeout=15,
+    )
+    resp.raise_for_status()
+    raw = resp.json()
+    df = pd.DataFrame(raw, columns=[
+        "open_time", "open", "high", "low", "close", "volume",
+        "close_time", "quote_asset_volume", "number_of_trades",
+        "taker_buy_base_asset_volume", "taker_buy_quote_asset_volume", "ignore",
+    ])
+    df["open_time"] = pd.to_datetime(df["open_time"], unit="ms", utc=True)
+    df["close_time"] = pd.to_datetime(df["close_time"], unit="ms", utc=True)
+    for col in ("open", "high", "low", "close"):
+        df[col] = df[col].astype(float)
+    return df
+
+
+def _get_signals() -> list[dict]:
+    now = pd.Timestamp.utcnow()
+    results = []
+    for symbol in BREAKOUT_SYMBOLS:
+        entry = {"symbol": symbol, "error": None}
+        try:
+            bars = _fetch_klines(symbol, "5m", N_BARS + 50)
+            completed = bars.loc[bars["close_time"] < now].reset_index(drop=True)
+            if len(completed) < N_BARS + 1:
+                entry["error"] = "not enough bars"
+                results.append(entry)
+                continue
+
+            last_bar = completed.iloc[-1]
+            prior = completed.iloc[-(N_BARS + 1):-1]
+            rolling_high = float(prior["high"].max())
+            last_close = float(last_bar["close"])
+            confirm = last_close >= rolling_high
+            gap_bps = round((last_close / rolling_high - 1) * 10_000, 1)
+
+            htf = _fetch_klines(symbol, "1h", 480)
+            htf_done = htf.loc[htf["close_time"] < now]
+            ema_20d = float(htf_done["close"].ewm(span=480, adjust=False).mean().iloc[-1])
+            regime_ok = last_close > ema_20d
+
+            entry.update({
+                "last_close": round(last_close, 8),
+                "rolling_high": round(rolling_high, 8),
+                "gap_bps": gap_bps,
+                "confirm": confirm,
+                "ema_20d": round(ema_20d, 8),
+                "regime_ok": regime_ok,
+                "signal": confirm and regime_ok,
+                "block_reason": (
+                    None if (confirm and regime_ok)
+                    else "below EMA" if (confirm and not regime_ok)
+                    else "no breakout" if (not confirm and regime_ok)
+                    else "no breakout + below EMA"
+                ),
+                "bar_time": last_bar["open_time"].isoformat(),
+            })
+        except Exception as e:
+            entry["error"] = str(e)
+        results.append(entry)
+    return results
+
+
+# ---------------------------------------------------------------------------
 # API routes
 # ---------------------------------------------------------------------------
 
-@app.route("/api/state")
-def api_state() -> Response:
-    return jsonify(_read_state())
+@app.route("/api/portfolio")
+def api_portfolio() -> Response:
+    return jsonify(_get_portfolio())
+
+
+@app.route("/api/orders")
+def api_orders() -> Response:
+    return jsonify(_get_open_orders())
 
 
 @app.route("/api/trades")
 def api_trades() -> Response:
     trades = _read_trades()
-    return jsonify({
-        "trades": trades[:50],
-        "summary": _pnl_summary(trades),
-    })
+    return jsonify({"trades": trades[:50], "summary": _pnl_summary(trades)})
+
+
+@app.route("/api/signals")
+def api_signals() -> Response:
+    return jsonify(_get_signals())
 
 
 @app.route("/api/health")
@@ -137,41 +284,49 @@ _HTML = """<!DOCTYPE html>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: 'Courier New', monospace; background: #0d0d0d; color: #e0e0e0; padding: 24px; }
   h1 { color: #00ff88; font-size: 1.4rem; margin-bottom: 4px; }
-  .subtitle { color: #666; font-size: 0.8rem; margin-bottom: 24px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .subtitle { color: #555; font-size: 0.78rem; margin-bottom: 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 24px; }
   .card { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; padding: 16px; }
-  .card h2 { font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 12px; }
-  .stat { font-size: 1.8rem; font-weight: bold; color: #fff; }
+  .card h2 { font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 8px; }
+  .stat { font-size: 1.6rem; font-weight: bold; color: #fff; }
   .stat.green { color: #00ff88; }
   .stat.red { color: #ff4444; }
-  .stat.yellow { color: #ffcc00; }
-  .symbol-card { background: #161616; border: 1px solid #2a2a2a; border-radius: 8px; padding: 14px; margin-bottom: 10px; }
-  .symbol-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-  .symbol-name { font-size: 1rem; font-weight: bold; color: #00ff88; }
-  .badge { font-size: 0.7rem; padding: 2px 8px; border-radius: 12px; font-weight: bold; }
-  .badge.active { background: #003322; color: #00ff88; border: 1px solid #00ff88; }
-  .badge.idle { background: #1a1a1a; color: #555; border: 1px solid #333; }
-  .row { display: flex; justify-content: space-between; font-size: 0.78rem; color: #aaa; margin-top: 4px; }
-  .row span:last-child { color: #e0e0e0; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  .section-title { font-size: 0.7rem; color: #666; text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: 10px; }
   table { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
-  th { text-align: left; color: #888; font-weight: normal; padding: 6px 8px; border-bottom: 1px solid #2a2a2a; }
-  td { padding: 6px 8px; border-bottom: 1px solid #1a1a1a; }
+  th { text-align: left; color: #555; font-weight: normal; padding: 5px 8px; border-bottom: 1px solid #222; }
+  td { padding: 5px 8px; border-bottom: 1px solid #1a1a1a; }
   .pos { color: #00ff88; }
   .neg { color: #ff4444; }
   .reason-stop { color: #ff4444; }
   .reason-target { color: #00ff88; }
   .reason-eod { color: #ffcc00; }
-  #last-updated { font-size: 0.7rem; color: #444; margin-top: 16px; }
+  .side-buy { color: #00ff88; }
+  .side-sell { color: #ff4444; }
+  #last-updated { font-size: 0.68rem; color: #333; margin-top: 20px; }
+  .error { color: #ff4444; font-size: 0.8rem; padding: 8px; }
 </style>
 </head>
 <body>
 <h1>88th Meridian</h1>
-<p class="subtitle">Auto-refreshes every 30s &nbsp;·&nbsp; <span id="mode"></span></p>
+<p class="subtitle">Refreshes every 30s &nbsp;·&nbsp; Roostoo live data</p>
 
 <div class="grid">
   <div class="card">
-    <h2>Active Positions</h2>
-    <div class="stat" id="stat-active">—</div>
+    <h2>Total Equity</h2>
+    <div class="stat" id="stat-equity">—</div>
+  </div>
+  <div class="card">
+    <h2>Free USD</h2>
+    <div class="stat" id="stat-usd">—</div>
+  </div>
+  <div class="card">
+    <h2>Open Positions</h2>
+    <div class="stat" id="stat-positions">—</div>
+  </div>
+  <div class="card">
+    <h2>Open Orders</h2>
+    <div class="stat" id="stat-orders">—</div>
   </div>
   <div class="card">
     <h2>Closed Trades</h2>
@@ -182,61 +337,95 @@ _HTML = """<!DOCTYPE html>
     <div class="stat" id="stat-winrate">—</div>
   </div>
   <div class="card">
-    <h2>Cumulative P&amp;L</h2>
+    <h2>Cum P&amp;L</h2>
     <div class="stat" id="stat-pnl">—</div>
   </div>
 </div>
 
-<div style="display:grid; grid-template-columns: 1fr 1fr; gap:16px;">
+<div class="two-col">
   <div>
-    <h2 style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px">Positions</h2>
-    <div id="positions"></div>
-  </div>
-  <div>
-    <h2 style="font-size:0.75rem;color:#888;text-transform:uppercase;letter-spacing:.08em;margin-bottom:12px">Recent Trades</h2>
+    <div class="section-title">Holdings</div>
     <table>
-      <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th>Reason</th><th>Price</th></tr></thead>
-      <tbody id="trades-body"></tbody>
+      <thead><tr><th>Asset</th><th>Total</th><th>Price</th><th>Value USD</th></tr></thead>
+      <tbody id="holdings-body"></tbody>
     </table>
   </div>
+  <div>
+    <div class="section-title">Open Orders</div>
+    <table>
+      <thead><tr><th>Pair</th><th>Side</th><th>Qty</th><th>Price</th></tr></thead>
+      <tbody id="orders-body"></tbody>
+    </table>
+  </div>
+</div>
+
+<div>
+  <div class="section-title">Recent Trades</div>
+  <table>
+    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Reason</th><th>Price</th></tr></thead>
+    <tbody id="trades-body"></tbody>
+  </table>
+</div>
+
+<div style="margin-top:24px">
+  <div class="section-title">Signal Scanner — what the bot sees right now</div>
+  <table>
+    <thead>
+      <tr>
+        <th>Symbol</th>
+        <th>Last Close</th>
+        <th>Rolling High (24h)</th>
+        <th>Gap</th>
+        <th>Confirm</th>
+        <th>20d EMA</th>
+        <th>Regime</th>
+        <th>Signal</th>
+        <th>Block Reason</th>
+      </tr>
+    </thead>
+    <tbody id="signals-body"></tbody>
+  </table>
 </div>
 
 <div id="last-updated">Last updated: —</div>
 
 <script>
+function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '—'; }
+function fmtUSD(n) { return n != null ? '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'; }
+
 async function refresh() {
   try {
-    const [stateRes, tradesRes] = await Promise.all([
-      fetch('/api/state'),
+    const [portRes, ordersRes, tradesRes, signalsRes] = await Promise.all([
+      fetch('/api/portfolio'),
+      fetch('/api/orders'),
       fetch('/api/trades'),
+      fetch('/api/signals'),
     ]);
-    const state = await stateRes.json();
+    const port = await portRes.json();
+    const orders = await ordersRes.json();
     const tradesData = await tradesRes.json();
-    render(state, tradesData);
+    const signals = await signalsRes.json();
+    render(port, orders, tradesData, signals);
   } catch(e) {
     console.error(e);
   }
 }
 
-function fmt(n, decimals=2) {
-  if (n == null) return '—';
-  return Number(n).toFixed(decimals);
-}
-
-function render(state, tradesData) {
-  const symbols = state.symbols || {};
+function render(port, orders, tradesData, signals) {
   const summary = tradesData.summary || {};
   const trades = tradesData.trades || [];
+  const positions = port.positions || [];
 
-  const active = Object.values(symbols).filter(s => s.active).length;
-  document.getElementById('stat-active').textContent = active + ' / ' + Object.keys(symbols).length;
-
-  const closed = summary.closed_trades ?? 0;
-  document.getElementById('stat-trades').textContent = closed;
+  // Stats
+  document.getElementById('stat-equity').textContent = fmtUSD(port.equity_usd);
+  document.getElementById('stat-usd').textContent = fmtUSD(port.usd_free);
+  document.getElementById('stat-positions').textContent = positions.length;
+  document.getElementById('stat-orders').textContent = orders.length;
+  document.getElementById('stat-trades').textContent = summary.closed_trades ?? '—';
 
   const wr = summary.win_rate;
   const wrEl = document.getElementById('stat-winrate');
-  wrEl.textContent = wr != null ? (wr * 100).toFixed(1) + '%' : '—';
+  wrEl.textContent = wr != null ? (wr*100).toFixed(1)+'%' : '—';
   wrEl.className = 'stat ' + (wr != null ? (wr >= 0.5 ? 'green' : 'red') : '');
 
   const pnl = summary.cum_pnl_bps ?? 0;
@@ -244,43 +433,69 @@ function render(state, tradesData) {
   pnlEl.textContent = (pnl >= 0 ? '+' : '') + fmt(pnl, 1) + ' bps';
   pnlEl.className = 'stat ' + (pnl >= 0 ? 'green' : 'red');
 
-  // Positions
-  const posDiv = document.getElementById('positions');
-  posDiv.innerHTML = '';
-  for (const [sym, s] of Object.entries(symbols)) {
-    const card = document.createElement('div');
-    card.className = 'symbol-card';
-    const badge = s.active ? '<span class="badge active">ACTIVE</span>' : '<span class="badge idle">IDLE</span>';
-    let inner = `<div class="symbol-header"><span class="symbol-name">${sym}</span>${badge}</div>`;
-    if (s.active) {
-      inner += `<div class="row"><span>Entry</span><span>${fmt(s.entry_price, 6)}</span></div>`;
-      inner += `<div class="row"><span>Stop</span><span class="neg">${fmt(s.stop_price, 6)}</span></div>`;
-      inner += `<div class="row"><span>Target</span><span class="pos">${fmt(s.target_price, 6)}</span></div>`;
-      inner += `<div class="row"><span>Qty</span><span>${fmt(s.qty, 4)}</span></div>`;
-      inner += `<div class="row"><span>Entry day</span><span>${s.entry_day || '—'}</span></div>`;
-    }
-    card.innerHTML = inner;
-    posDiv.appendChild(card);
-  }
+  // Holdings
+  const hbody = document.getElementById('holdings-body');
+  hbody.innerHTML = positions.length ? positions.map(p => `
+    <tr>
+      <td>${p.asset}</td>
+      <td>${fmt(p.total, 4)}</td>
+      <td>${p.price ? '$'+fmt(p.price, 6) : '—'}</td>
+      <td class="pos">${fmtUSD(p.value_usd)}</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="color:#444">No open positions</td></tr>';
+
+  // Open orders
+  const obody = document.getElementById('orders-body');
+  obody.innerHTML = orders.length ? orders.map(o => `
+    <tr>
+      <td>${o.pair}</td>
+      <td class="${o.side==='BUY'?'side-buy':'side-sell'}">${o.side}</td>
+      <td>${o.quantity}</td>
+      <td>${o.price}</td>
+    </tr>`).join('') : '<tr><td colspan="4" style="color:#444">No open orders</td></tr>';
 
   // Recent trades
   const tbody = document.getElementById('trades-body');
-  tbody.innerHTML = '';
-  for (const t of trades.slice(0, 30)) {
-    const time = t.logged_at ? t.logged_at.slice(0, 19).replace('T', ' ') : '—';
-    const reasonClass = t.reason === 'stop' ? 'reason-stop' : t.reason === 'target_resting' ? 'reason-target' : 'reason-eod';
-    const sideClass = t.side === 'BUY' ? 'pos' : 'neg';
-    const price = t.price != null ? fmt(t.price, 6) : '—';
-    tbody.innerHTML += `<tr>
+  tbody.innerHTML = trades.slice(0,30).map(t => {
+    const time = t.logged_at ? t.logged_at.slice(0,19).replace('T',' ') : '—';
+    const rc = t.reason==='stop' ? 'reason-stop' : t.reason==='target_resting' ? 'reason-target' : 'reason-eod';
+    return `<tr>
       <td>${time}</td>
       <td>${t.symbol}</td>
-      <td class="${sideClass}">${t.side}</td>
-      <td class="${reasonClass}">${t.reason}</td>
-      <td>${price}</td>
+      <td class="${t.side==='BUY'?'side-buy':'side-sell'}">${t.side}</td>
+      <td class="${rc}">${t.reason}</td>
+      <td>${t.price != null ? fmt(t.price,6) : '—'}</td>
     </tr>`;
-  }
+  }).join('') || '<tr><td colspan="5" style="color:#444">No trades yet</td></tr>';
 
-  document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  // Signal scanner
+  const sbody = document.getElementById('signals-body');
+  sbody.innerHTML = (signals || []).map(s => {
+    if (s.error) return `<tr><td>${s.symbol}</td><td colspan="8" style="color:#ff4444">${s.error}</td></tr>`;
+    const signalCell = s.signal
+      ? '<td style="color:#00ff88;font-weight:bold">FIRE</td>'
+      : '<td style="color:#444">—</td>';
+    const confirmCell = s.confirm
+      ? '<td class="pos">YES</td>'
+      : '<td class="neg">NO</td>';
+    const regimeCell = s.regime_ok
+      ? '<td class="pos">YES</td>'
+      : '<td class="neg">NO</td>';
+    const gap = s.gap_bps != null ? (s.gap_bps >= 0 ? '+' : '') + s.gap_bps + ' bps' : '—';
+    const gapClass = s.gap_bps >= 0 ? 'pos' : 'neg';
+    return `<tr>
+      <td>${s.symbol}</td>
+      <td>${s.last_close ?? '—'}</td>
+      <td>${s.rolling_high ?? '—'}</td>
+      <td class="${gapClass}">${gap}</td>
+      ${confirmCell}
+      <td>${s.ema_20d ?? '—'}</td>
+      ${regimeCell}
+      ${signalCell}
+      <td style="color:#555">${s.block_reason ?? ''}</td>
+    </tr>`;
+  }).join('') || '<tr><td colspan="9" style="color:#444">Loading...</td></tr>';
+
+  document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
 }
 
 refresh();
@@ -301,25 +516,19 @@ def index() -> Response:
 # ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Bot monitoring dashboard")
+    p = argparse.ArgumentParser(description="88th Meridian local dashboard")
     p.add_argument("--port", type=int, default=8080)
-    p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--competition", action="store_true")
     return p.parse_args()
 
 
 def main() -> int:
+    global _live_config
     args = parse_args()
-    live = build_live_config(competition=args.competition)
+    _live_config = build_live_config(competition=args.competition)
 
-    global _state_path, _trades_path
-    _state_path = live.state_path
-    _trades_path = live.state_path.parent / "trades.jsonl"
-
-    print(f"Dashboard running on http://{args.host}:{args.port}")
-    print(f"State file:  {_state_path}")
-    print(f"Trades file: {_trades_path}")
-    app.run(host=args.host, port=args.port, debug=False)
+    print(f"Dashboard: http://localhost:{args.port}")
+    app.run(host="127.0.0.1", port=args.port, debug=False)
     return 0
 
 
