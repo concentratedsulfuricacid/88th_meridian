@@ -303,7 +303,8 @@ def _process_symbol(
                 and sym_state.target_price > 0.0
                 and current_price < sym_state.target_price
                 and live.live_trading):
-            target_qty = round_quantity(symbol, sym_state.qty, rules, prices)
+            asset_free = float(wallet.get(asset, {}).get("free", 0.0))
+            target_qty = round_quantity(symbol, min(asset_free, sym_state.qty), rules, prices)
             if target_qty > 0.0:
                 resp = client.place_limit_order(
                     symbol=symbol, side="SELL", quantity=target_qty,
