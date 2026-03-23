@@ -307,7 +307,7 @@ def _process_symbol(
             if target_qty > 0.0:
                 resp = client.place_limit_order(
                     symbol=symbol, side="SELL", quantity=target_qty,
-                    price=sym_state.target_price,
+                    price=round_price(symbol, sym_state.target_price, rules),
                 )
                 append_trade_log(live, symbol=symbol, side="SELL",
                                  reason="target_resting_recovery",
