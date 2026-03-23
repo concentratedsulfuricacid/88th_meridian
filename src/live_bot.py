@@ -225,6 +225,27 @@ def round_quantity(
     return rounded
 
 
+def round_price(
+    symbol: str,
+    price: float,
+    rules: dict[str, dict[str, Any]],
+) -> float:
+    """Round a limit order price to the exchange's price step size."""
+    pair = RoostooClient.normalize_pair(symbol)
+    detail = rules.get(pair, {})
+    # Roostoo documents PricePrecision as the decimal places for limit order prices.
+    if "PricePrecision" in detail:
+        precision = int(detail["PricePrecision"])
+    else:
+        # Fallback: infer from price magnitude if field missing
+        if price <= 0.0:
+            return price
+        magnitude = math.floor(math.log10(price))
+        precision = max(0, 4 - magnitude)
+    factor = 10 ** precision
+    return round(price * factor) / factor
+
+
 def _filled_quantity(response: dict[str, Any]) -> float:
     detail = response.get("OrderDetail", {}) if isinstance(response, dict) else {}
     for key in ("FilledQuantity", "Quantity"):
@@ -374,8 +395,8 @@ def _process_symbol(
     filled_qty = qty
     target_order_id = ""
     # Anchor stop/target to rolling_high, matching the backtest entry reference.
-    stop = rolling_high * (1.0 - STOP_BPS / 10_000.0)
-    target = rolling_high * (1.0 + TARGET_BPS / 10_000.0)
+    stop = round_price(symbol, rolling_high * (1.0 - STOP_BPS / 10_000.0), rules)
+    target = round_price(symbol, rolling_high * (1.0 + TARGET_BPS / 10_000.0), rules)
 
     if live.live_trading:
         # Entry: limit at current_price — fills immediately (price is above rolling_high).
@@ -415,6 +436,73 @@ def _process_symbol(
 
 
 # ---------------------------------------------------------------------------
+# Compliance trade
+# ---------------------------------------------------------------------------
+
+# Must be a symbol NOT in BREAKOUT_SYMBOLS to avoid any conflict with the
+# breakout loop (stale orders, balance checks, state mutations).
+COMPLIANCE_SYMBOL: str = "BTCUSDT"
+COMPLIANCE_NOTIONAL: float = 5.0       # USD — kept tiny; ~$0.005 in fees on $1M portfolio
+COMPLIANCE_HOUR_UTC: int = 20          # fire at 20:00 UTC if no trade today
+
+
+def _traded_today(live: LiveConfig) -> bool:
+    """Return True if any trade was logged today (UTC)."""
+    trades_path = live.state_path.parent / "trades.jsonl"
+    if not trades_path.exists():
+        return False
+    today = pd.Timestamp.utcnow().strftime("%Y-%m-%d")
+    try:
+        with trades_path.open(encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    rec = json.loads(line)
+                    if rec.get("logged_at", "").startswith(today):
+                        return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return False
+
+
+def _run_compliance_trade(
+    live: LiveConfig,
+    client: RoostooClient,
+    rules: dict[str, dict[str, Any]],
+    prices: dict[str, float],
+) -> None:
+    """Place a $1 buy + immediate sell on DOGE to satisfy daily activity requirement."""
+    now = pd.Timestamp.utcnow()
+    if now.hour < COMPLIANCE_HOUR_UTC:
+        return
+    if _traded_today(live):
+        return
+
+    pair = RoostooClient.normalize_pair(COMPLIANCE_SYMBOL)
+    price = prices.get(pair, 0.0)
+    if price <= 0.0:
+        return
+
+    qty = round_quantity(COMPLIANCE_SYMBOL, COMPLIANCE_NOTIONAL / price, rules, prices)
+    if qty <= 0.0:
+        return
+
+    if live.live_trading:
+        buy_resp = client.place_limit_order(
+            symbol=COMPLIANCE_SYMBOL, side="BUY", quantity=qty, price=price
+        )
+        append_trade_log(live, symbol=COMPLIANCE_SYMBOL, side="BUY",
+                         reason="compliance", requested_qty=qty, response=buy_resp)
+        if _order_succeeded(buy_resp):
+            sell_resp = client.place_limit_order(
+                symbol=COMPLIANCE_SYMBOL, side="SELL", quantity=qty, price=price
+            )
+            append_trade_log(live, symbol=COMPLIANCE_SYMBOL, side="SELL",
+                             reason="compliance", requested_qty=qty, response=sell_resp)
+
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 
@@ -433,6 +521,8 @@ def run_once(live: LiveConfig) -> BotState:
         # Refresh wallet between symbols so free balance stays accurate
         wallet = wallet_holdings(client)
         _process_symbol(symbol, live, client, rules, prices, wallet, state, equity)
+
+    _run_compliance_trade(live, client, rules, prices)
 
     save_state(live.state_path, state)
     return state
