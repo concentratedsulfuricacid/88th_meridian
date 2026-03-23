@@ -298,6 +298,25 @@ def _process_symbol(
             sym_state.target_order_id = ""
             return
 
+        # Re-place missing resting target order (e.g. failed on initial entry)
+        if (sym_state.target_order_id == ""
+                and sym_state.target_price > 0.0
+                and current_price < sym_state.target_price
+                and live.live_trading):
+            target_qty = round_quantity(symbol, sym_state.qty, rules, prices)
+            if target_qty > 0.0:
+                resp = client.place_limit_order(
+                    symbol=symbol, side="SELL", quantity=target_qty,
+                    price=sym_state.target_price,
+                )
+                append_trade_log(live, symbol=symbol, side="SELL",
+                                 reason="target_resting_recovery",
+                                 requested_qty=target_qty, response=resp)
+                if _order_succeeded(resp):
+                    detail = resp.get("OrderDetail", {})
+                    sym_state.target_order_id = str(detail.get("OrderID", "")) if isinstance(detail, dict) else ""
+                    print(f"[{symbol}] resting target order recovered: {sym_state.target_order_id}")
+
         exit_price: float | None = None
         reason = ""
 
