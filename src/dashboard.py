@@ -28,6 +28,7 @@ _live_config = None
 
 LIMIT_FEE_RATE = 0.0005
 ROUND_TRIP_FEE_BPS = LIMIT_FEE_RATE * 2.0 * 10_000.0
+ORDER_RECORDS_DIR = Path("order_records")
 
 
 def _client() -> RoostooClient:
@@ -197,6 +198,10 @@ def _get_open_orders() -> list[dict]:
 
 
 def _read_trades(limit: int = 200) -> list[dict]:
+    order_records = _read_order_records(limit)
+    if order_records:
+        return order_records
+
     trades_path = Path(_live_config.state_path).parent / "trades.jsonl"
     if not trades_path.exists():
         return []
@@ -212,16 +217,65 @@ def _read_trades(limit: int = 200) -> list[dict]:
             records.append(json.loads(line))
         except Exception:
             continue
-    return list(reversed(records))
+    return records
+
+
+def _read_order_records(limit: int = 200) -> list[dict]:
+    export_path = ORDER_RECORDS_DIR / f"{_live_config.bot_mode}_orders.json"
+    if not export_path.exists():
+        return []
+
+    try:
+        payload = json.loads(export_path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+    raw_orders = payload.get("orders", {}).get("OrderMatched", [])
+    if not isinstance(raw_orders, list):
+        return []
+
+    records = []
+    for order in raw_orders[-limit:]:
+        if not isinstance(order, dict):
+            continue
+        timestamp = order.get("FinishTimestamp") or order.get("CreateTimestamp")
+        logged_at = ""
+        try:
+            if timestamp:
+                logged_at = pd.to_datetime(int(timestamp), unit="ms", utc=True).isoformat()
+        except Exception:
+            logged_at = ""
+
+        pair = str(order.get("Pair", ""))
+        symbol = pair.replace("/USD", "USDT").replace("/", "")
+        filled_price = order.get("FilledAverPrice")
+        price = filled_price if filled_price not in (None, 0, 0.0, "0", "0.0", "") else order.get("Price")
+        status = str(order.get("Status", ""))
+        role = str(order.get("Role", ""))
+        records.append({
+            "logged_at": logged_at,
+            "symbol": symbol,
+            "side": order.get("Side", ""),
+            "reason": status.lower(),
+            "price": price,
+            "status": status,
+            "role": role,
+            "order_id": order.get("OrderID", ""),
+            "qty": order.get("FilledQuantity") or order.get("Quantity") or 0,
+        })
+    return records
 
 
 def _pnl_summary(trades: list[dict]) -> dict:
     buys: dict[str, dict] = {}
     closed = []
-    for record in reversed(trades):
+    for record in trades:
         sym = record.get("symbol", "")
         side = record.get("side", "")
         reason = record.get("reason", "")
+        status = str(record.get("status", "FILLED")).upper()
+        if status not in ("", "FILLED"):
+            continue
         if side == "BUY":
             buys[sym] = record
         elif side == "SELL" and reason != "target_resting":
@@ -250,7 +304,7 @@ def _pnl_summary(trades: list[dict]) -> dict:
         "win_rate": round(len(wins) / len(closed), 3) if closed else None,
         "mean_pnl_bps": round(sum(t["pnl_bps"] for t in closed) / len(closed), 1) if closed else None,
         "cum_pnl_bps": round(sum(t["pnl_bps"] for t in closed), 1),
-        "recent_closed": closed[:10],
+        "recent_closed": closed[-10:],
     }
 
 
@@ -456,7 +510,7 @@ _HTML = """<!DOCTYPE html>
 <div>
   <div class="section-title">Recent Trades</div>
   <table>
-    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Reason</th><th>Price</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Reason / Status</th><th>Price</th></tr></thead>
     <tbody id="trades-body"></tbody>
   </table>
 </div>
@@ -571,14 +625,15 @@ function render(port, orders, tradesData, signals) {
 
   // Recent trades
   const tbody = document.getElementById('trades-body');
-  tbody.innerHTML = trades.slice(0,30).map(t => {
+  tbody.innerHTML = trades.slice(-30).map(t => {
     const time = t.logged_at ? t.logged_at.slice(0,19).replace('T',' ') : '—';
-    const rc = t.reason==='stop' ? 'reason-stop' : t.reason==='target_resting' ? 'reason-target' : 'reason-eod';
+    const label = t.reason || t.status || '—';
+    const rc = label==='stop' ? 'reason-stop' : label==='target_resting' || label==='filled' ? 'reason-target' : 'reason-eod';
     return `<tr>
       <td>${time}</td>
       <td>${t.symbol}</td>
       <td class="${t.side==='BUY'?'side-buy':'side-sell'}">${t.side}</td>
-      <td class="${rc}">${t.reason}</td>
+      <td class="${rc}">${label}</td>
       <td>${t.price != null ? fmt(t.price,6) : '—'}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="5" style="color:#444">No trades yet</td></tr>';
