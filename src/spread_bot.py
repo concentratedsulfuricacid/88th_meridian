@@ -148,14 +148,18 @@ def main() -> None:
 
             coin_before = get_balance(client, coin)
             usd_before  = get_balance(client, "USD")
-            size_usd    = min(
-                args.size_usd if args.size_usd is not None else usd_before,
-                usd_before * 0.999,
-            )
-            if size_usd < 1.0:
-                print(f"  [SKIP] insufficient USD ({usd_before:.2f})", flush=True)
-                time.sleep(5)
-                continue
+            if args.size_usd is not None:
+                size_usd = args.size_usd
+                if usd_before < size_usd:
+                    print(f"  [SKIP] insufficient USD ({usd_before:.2f} < {size_usd:.2f})", flush=True)
+                    time.sleep(5)
+                    continue
+            else:
+                size_usd = usd_before * 0.90  # 90% of free balance
+                if size_usd < 1.0:
+                    print(f"  [SKIP] insufficient USD ({usd_before:.2f})", flush=True)
+                    time.sleep(5)
+                    continue
 
             qty = int(size_usd / bid)
             if qty <= 0:
