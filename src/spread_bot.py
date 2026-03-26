@@ -238,7 +238,10 @@ def main() -> None:
 
         # ── IN_POSITION: poll for sell fill, SL, or time-stop ─────────────
         elif status == "IN_POSITION":
-            coin_now   = get_balance(client, coin)
+            # Use total balance (free+lock) so locked sell orders don't falsely trigger fill detection
+            _wallet    = RoostooClient.wallet_from_balances(client.get_balances())
+            _v         = _wallet.get(coin, {})
+            coin_now   = _v.get("free", 0.0) + _v.get("lock", 0.0)
             bid        = float(state["buy_price"])
             sell_px    = float(state["sell_price"])
             qty        = int(state["qty"])
