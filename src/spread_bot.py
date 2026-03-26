@@ -275,6 +275,7 @@ def main() -> None:
                     "exit_reason": "fill",
                 })
                 recent_ts.append(time.time())
+                time.sleep(1)  # wait for USD to be credited before next cycle
                 state.update({"status": "FLAT", "sell_order_id": None, "sell_price": None})
                 save_state(state_path, state)
 
