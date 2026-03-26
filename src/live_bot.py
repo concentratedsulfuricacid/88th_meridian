@@ -386,6 +386,12 @@ def _process_symbol(
     if float(last_bar["close"]) < rolling_high:
         return
 
+    # Volume confirmation: breakout bar volume must be >= 1.5x 20-bar average.
+    # Low-volume breakouts are fakeouts in ranging markets.
+    avg_volume = float(prior_bars["volume"].tail(20).mean())
+    if avg_volume > 0 and float(last_bar["volume"]) < avg_volume * 1.5:
+        return
+
     # Regime gate: skip if close is below 20d EMA.
     # Use 1h bars (480 bars = 20 days) so the EWM is fully warmed up in one API call.
     try:

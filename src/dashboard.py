@@ -19,12 +19,15 @@ import pandas as pd
 import requests
 from flask import Flask, Response, jsonify
 
-from .live_bot import BREAKOUT_SYMBOLS, N_BARS
+from .live_bot import BREAKOUT_SYMBOLS, N_BARS, BotState, load_state
 from .live_config import build_live_config
 from .roostoo_client import RoostooClient
 
 app = Flask(__name__)
 _live_config = None
+
+LIMIT_FEE_RATE = 0.0005
+ROUND_TRIP_FEE_BPS = LIMIT_FEE_RATE * 2.0 * 10_000.0
 
 
 def _client() -> RoostooClient:
@@ -34,6 +37,81 @@ def _client() -> RoostooClient:
 # ---------------------------------------------------------------------------
 # Data helpers
 # ---------------------------------------------------------------------------
+
+def _safe_load_state() -> BotState:
+    try:
+        return load_state(_live_config.state_path)
+    except Exception:
+        return BotState()
+
+
+def _estimate_live_pnl(entry_price: float, mark_price: float, qty: float) -> dict:
+    gross_pnl_usd = (mark_price - entry_price) * qty
+    net_pnl_usd = (mark_price * qty * (1.0 - LIMIT_FEE_RATE)) - (entry_price * qty * (1.0 + LIMIT_FEE_RATE))
+    fee_drag_usd = gross_pnl_usd - net_pnl_usd
+    notional = entry_price * qty
+    gross_pnl_bps = (gross_pnl_usd / notional) * 10_000.0 if notional > 0.0 else None
+    net_pnl_bps = (net_pnl_usd / notional) * 10_000.0 if notional > 0.0 else None
+    return {
+        "gross_pnl_usd": round(gross_pnl_usd, 2),
+        "net_pnl_usd": round(net_pnl_usd, 2),
+        "fee_drag_usd": round(fee_drag_usd, 2),
+        "gross_pnl_bps": round(gross_pnl_bps, 1) if gross_pnl_bps is not None else None,
+        "net_pnl_bps": round(net_pnl_bps, 1) if net_pnl_bps is not None else None,
+    }
+
+
+def _compute_live_pnl(
+    wallet: dict[str, dict[str, float]],
+    prices: dict[str, float],
+    state: BotState,
+) -> tuple[dict[str, dict], dict]:
+    pnl_by_asset: dict[str, dict] = {}
+    summary = {
+        "open_positions": 0,
+        "gross_pnl_usd": 0.0,
+        "net_pnl_usd": 0.0,
+        "fee_drag_usd": 0.0,
+        "gross_pnl_bps": None,
+        "net_pnl_bps": None,
+        "tracked_notional_usd": 0.0,
+        "fee_assumption_bps_round_trip": ROUND_TRIP_FEE_BPS,
+    }
+
+    for symbol, sym_state in state.symbols.items():
+        if not sym_state.active or sym_state.qty <= 0.0 or sym_state.entry_price <= 0.0:
+            continue
+        asset = symbol.replace("USDT", "")
+        held_qty = float(wallet.get(asset, {}).get("free", 0.0)) + float(wallet.get(asset, {}).get("lock", 0.0))
+        live_qty = min(held_qty, sym_state.qty)
+        mark_price = prices.get(f"{asset}/USD", 0.0)
+        if live_qty <= 0.0 or mark_price <= 0.0:
+            continue
+
+        pnl = _estimate_live_pnl(sym_state.entry_price, mark_price, live_qty)
+        pnl_by_asset[asset] = {
+            "symbol": symbol,
+            "entry_price": round(sym_state.entry_price, 8),
+            "tracked_qty": round(live_qty, 6),
+            **pnl,
+        }
+        summary["open_positions"] += 1
+        summary["gross_pnl_usd"] += pnl["gross_pnl_usd"]
+        summary["net_pnl_usd"] += pnl["net_pnl_usd"]
+        summary["fee_drag_usd"] += pnl["fee_drag_usd"]
+        summary["tracked_notional_usd"] += sym_state.entry_price * live_qty
+
+    tracked_notional = summary["tracked_notional_usd"]
+    if tracked_notional > 0.0:
+        summary["gross_pnl_bps"] = round((summary["gross_pnl_usd"] / tracked_notional) * 10_000.0, 1)
+        summary["net_pnl_bps"] = round((summary["net_pnl_usd"] / tracked_notional) * 10_000.0, 1)
+
+    summary["gross_pnl_usd"] = round(summary["gross_pnl_usd"], 2)
+    summary["net_pnl_usd"] = round(summary["net_pnl_usd"], 2)
+    summary["fee_drag_usd"] = round(summary["fee_drag_usd"], 2)
+    summary["tracked_notional_usd"] = round(summary["tracked_notional_usd"], 2)
+    return pnl_by_asset, summary
+
 
 def _get_portfolio() -> dict:
     client = _client()
@@ -55,6 +133,9 @@ def _get_portfolio() -> dict:
     except Exception:
         prices = {}
 
+    state = _safe_load_state()
+    pnl_by_asset, live_pnl = _compute_live_pnl(wallet, prices, state)
+
     # Compute equity
     equity = 0.0
     positions = []
@@ -70,19 +151,23 @@ def _get_portfolio() -> dict:
         value = total * price if price > 0 else 0.0
         equity += value
         if total > 0:
-            positions.append({
+            position = {
                 "asset": asset,
                 "free": round(free, 6),
                 "lock": round(lock, 6),
                 "total": round(total, 6),
                 "price": price,
                 "value_usd": round(value, 2),
-            })
+            }
+            if asset in pnl_by_asset:
+                position.update(pnl_by_asset[asset])
+            positions.append(position)
 
     return {
         "equity_usd": round(equity, 2),
         "usd_free": round(float(wallet.get("USD", {}).get("free", 0.0)), 2),
         "positions": sorted(positions, key=lambda x: x["value_usd"], reverse=True),
+        "live_pnl": live_pnl,
     }
 
 
@@ -340,13 +425,22 @@ _HTML = """<!DOCTYPE html>
     <h2>Cum P&amp;L</h2>
     <div class="stat" id="stat-pnl">—</div>
   </div>
+  <div class="card">
+    <h2>Live Gross P&amp;L</h2>
+    <div class="stat" id="stat-gross-pnl">—</div>
+  </div>
+  <div class="card">
+    <h2>Live Net P&amp;L</h2>
+    <div class="stat" id="stat-net-pnl">—</div>
+  </div>
 </div>
 
 <div class="two-col">
   <div>
     <div class="section-title">Holdings</div>
+    <div style="font-size:0.68rem;color:#444;margin-bottom:8px">Net P&amp;L assumes 10 bps round-trip fees on tracked strategy positions.</div>
     <table>
-      <thead><tr><th>Asset</th><th>Total</th><th>Price</th><th>Value USD</th></tr></thead>
+      <thead><tr><th>Asset</th><th>Total</th><th>Entry</th><th>Price</th><th>Value USD</th><th>Gross P&amp;L</th><th>Net P&amp;L</th></tr></thead>
       <tbody id="holdings-body"></tbody>
     </table>
   </div>
@@ -392,6 +486,14 @@ _HTML = """<!DOCTYPE html>
 <script>
 function fmt(n, d=2) { return n != null ? Number(n).toFixed(d) : '—'; }
 function fmtUSD(n) { return n != null ? '$' + Number(n).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2}) : '—'; }
+function fmtSignedUSD(n) {
+  if (n == null) return '—';
+  const value = Number(n);
+  const abs = Math.abs(value).toLocaleString('en-US', {minimumFractionDigits:2, maximumFractionDigits:2});
+  return (value >= 0 ? '+$' : '-$') + abs;
+}
+function signedClass(n) { return n == null ? '' : (Number(n) >= 0 ? 'green' : 'red'); }
+function signedCellClass(n) { return n == null ? '' : (Number(n) >= 0 ? 'pos' : 'neg'); }
 
 async function refresh() {
   try {
@@ -415,6 +517,7 @@ function render(port, orders, tradesData, signals) {
   const summary = tradesData.summary || {};
   const trades = tradesData.trades || [];
   const positions = port.positions || [];
+  const livePnl = port.live_pnl || {};
 
   // Stats
   document.getElementById('stat-equity').textContent = fmtUSD(port.equity_usd);
@@ -433,15 +536,28 @@ function render(port, orders, tradesData, signals) {
   pnlEl.textContent = (pnl >= 0 ? '+' : '') + fmt(pnl, 1) + ' bps';
   pnlEl.className = 'stat ' + (pnl >= 0 ? 'green' : 'red');
 
+  const grossPnl = livePnl.gross_pnl_usd;
+  const grossPnlEl = document.getElementById('stat-gross-pnl');
+  grossPnlEl.textContent = grossPnl != null ? fmtSignedUSD(grossPnl) : '—';
+  grossPnlEl.className = 'stat ' + signedClass(grossPnl);
+
+  const netPnl = livePnl.net_pnl_usd;
+  const netPnlEl = document.getElementById('stat-net-pnl');
+  netPnlEl.textContent = netPnl != null ? fmtSignedUSD(netPnl) : '—';
+  netPnlEl.className = 'stat ' + signedClass(netPnl);
+
   // Holdings
   const hbody = document.getElementById('holdings-body');
   hbody.innerHTML = positions.length ? positions.map(p => `
     <tr>
       <td>${p.asset}</td>
       <td>${fmt(p.total, 4)}</td>
+      <td>${p.entry_price != null ? '$'+fmt(p.entry_price, 6) : '—'}</td>
       <td>${p.price ? '$'+fmt(p.price, 6) : '—'}</td>
       <td class="pos">${fmtUSD(p.value_usd)}</td>
-    </tr>`).join('') : '<tr><td colspan="4" style="color:#444">No open positions</td></tr>';
+      <td class="${signedCellClass(p.gross_pnl_usd)}">${p.gross_pnl_usd != null ? fmtSignedUSD(p.gross_pnl_usd) : '—'}</td>
+      <td class="${signedCellClass(p.net_pnl_usd)}">${p.net_pnl_usd != null ? fmtSignedUSD(p.net_pnl_usd) : '—'}</td>
+    </tr>`).join('') : '<tr><td colspan="7" style="color:#444">No open positions</td></tr>';
 
   // Open orders
   const obody = document.getElementById('orders-body');
