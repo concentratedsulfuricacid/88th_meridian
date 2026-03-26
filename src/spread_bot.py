@@ -70,6 +70,7 @@ def main() -> None:
     ap.add_argument("--symbol",       default="PEPEUSDT")
     ap.add_argument("--size-usd",     type=float, default=300_000.0)
     ap.add_argument("--minutes",      type=float, default=480.0)
+    ap.add_argument("--forever",      action="store_true", help="Run indefinitely (ignores --minutes)")
     ap.add_argument("--max-tpm",      type=float, default=15.0,
                     help="Max trades per minute (rate limit)")
     ap.add_argument("--fill-timeout", type=float, default=1800.0,
@@ -102,7 +103,7 @@ def main() -> None:
     cum_net   = 0.0
     trade_num = 0
     recent_ts: deque = deque()
-    deadline  = time.time() + args.minutes * 60
+    deadline  = float("inf") if args.forever else time.time() + args.minutes * 60
 
     print(f"[{acct}] Spread capture  {pair}  size=${args.size_usd:,.0f}", flush=True)
     print(f"fill_timeout={args.fill_timeout:.0f}s  max_tpm={args.max_tpm}  fee=10bps", flush=True)
