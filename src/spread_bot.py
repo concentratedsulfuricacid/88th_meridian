@@ -114,7 +114,7 @@ def main() -> None:
     deadline = float("inf") if args.forever else time.time() + args.minutes * 60
     recent_ts: deque = deque()
 
-    print(f"[{acct}] Spread capture  {pair}  size=${args.size_usd:,.0f}", flush=True)
+    print(f"[{acct}] Spread capture  {pair}  size={'full' if args.size_usd is None else f'${args.size_usd:,.0f}'}", flush=True)
     print(f"fill_timeout={args.fill_timeout:.0f}s  size={'full' if args.size_usd is None else f'${args.size_usd:,.0f}'}  fee=10bps", flush=True)
     print(f"State → {state_path}", flush=True)
     print(f"Log   → {log_path}", flush=True)
