@@ -152,6 +152,10 @@ def main() -> None:
                 args.size_usd if args.size_usd is not None else usd_before,
                 usd_before * 0.999,
             )
+            if size_usd < 1.0:
+                print(f"  [SKIP] insufficient USD ({usd_before:.2f})", flush=True)
+                time.sleep(5)
+                continue
 
             qty = int(size_usd / bid)
             if qty <= 0:
@@ -194,7 +198,7 @@ def main() -> None:
                 print(f"  [BUY ] filled  qty={filled_qty:,}  px={bid:.8f}", flush=True)
 
                 _, ask_now = get_bid_ask(client, pair)
-                sell_px    = ask_now if ask_now else bid * 1.0029
+                sell_px    = ask_now if (ask_now and ask_now > bid) else bid * 1.0029
 
                 resp2 = client.place_limit_order(symbol=pair, side="SELL", quantity=filled_qty, price=sell_px)
                 if not resp2.get("Success"):
