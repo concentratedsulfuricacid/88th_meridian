@@ -161,7 +161,7 @@ def main() -> None:
                     time.sleep(5)
                     continue
 
-            qty = int(size_usd / bid)
+            qty = (int(size_usd / bid) // 10) * 10  # round down to step size 10
             if qty <= 0:
                 time.sleep(1)
                 continue
@@ -198,7 +198,7 @@ def main() -> None:
             buy_id      = state["buy_order_id"]
 
             if coin_now >= coin_before + qty * 0.99:
-                filled_qty = int(coin_now - coin_before)
+                filled_qty = (int(coin_now - coin_before) // 10) * 10
                 print(f"  [BUY ] filled  qty={filled_qty:,}  px={bid:.8f}", flush=True)
 
                 _, ask_now = get_bid_ask(client, pair)
