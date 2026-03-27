@@ -175,13 +175,15 @@ def _get_portfolio() -> dict:
 def _get_open_orders() -> list[dict]:
     client = _client()
     try:
-        resp = client.query_orders(pending_only=True)
-        orders = resp.get("OrderList") or resp.get("Orders") or []
+        resp = client.query_orders(pending_only=False)
+        orders = resp.get("OrderMatched") or []
         if not isinstance(orders, list):
             return []
         out = []
         for o in orders:
             if not isinstance(o, dict):
+                continue
+            if str(o.get("Status", "")).upper() != "PENDING":
                 continue
             out.append({
                 "order_id": o.get("OrderID", ""),
@@ -197,7 +199,49 @@ def _get_open_orders() -> list[dict]:
         return []
 
 
+def _read_spread_csv(limit: int = 50) -> list[dict]:
+    logs_dir = Path("src/state/spread_logs")
+    if not logs_dir.exists():
+        return []
+    records = []
+    for csv_path in sorted(logs_dir.glob("*.csv")):
+        try:
+            df = pd.read_csv(csv_path)
+            for _, row in df.iterrows():
+                records.append({
+                    "logged_at": str(row.get("timestamp", "")),
+                    "symbol": str(row.get("pair", "")).replace("/USD", "USDT"),
+                    "side": "SELL",
+                    "reason": str(row.get("exit_reason", "fill")),
+                    "price": row.get("sell_price"),
+                    "net_bps": round(float(row.get("net_bps", 0)), 2),
+                    "status": "FILLED",
+                    "order_id": "",
+                })
+        except Exception:
+            pass
+    records.sort(key=lambda x: x.get("logged_at", ""), reverse=True)
+    return records[:limit]
+
+
+def _get_spread_bot_state() -> dict:
+    state_dir = Path("src/state")
+    states = []
+    for state_file in sorted(state_dir.glob("spread_state_*.json")):
+        try:
+            s = json.loads(state_file.read_text())
+            s["_file"] = state_file.stem
+            states.append(s)
+        except Exception:
+            pass
+    return {"bots": states}
+
+
 def _read_trades(limit: int = 200) -> list[dict]:
+    spread_trades = _read_spread_csv(limit)
+    if spread_trades:
+        return spread_trades
+
     order_records = _read_order_records(limit)
     if order_records:
         return order_records
@@ -404,6 +448,11 @@ def api_signals() -> Response:
     return jsonify(_get_signals())
 
 
+@app.route("/api/spread_status")
+def api_spread_status() -> Response:
+    return jsonify(_get_spread_bot_state())
+
+
 @app.route("/api/health")
 def api_health() -> Response:
     return jsonify({"ok": True})
@@ -510,8 +559,16 @@ _HTML = """<!DOCTYPE html>
 <div>
   <div class="section-title">Recent Trades</div>
   <table>
-    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Reason / Status</th><th>Price</th></tr></thead>
+    <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Reason</th><th>Price</th><th>Net bps</th></tr></thead>
     <tbody id="trades-body"></tbody>
+  </table>
+</div>
+
+<div style="margin-top:24px">
+  <div class="section-title">Spread Bot Status</div>
+  <table>
+    <thead><tr><th>Bot</th><th>Status</th><th>Pair</th><th>Buy Price</th><th>Sell Price</th><th>Qty</th><th>Cum Net (bps)</th><th>Trades</th></tr></thead>
+    <tbody id="spread-body"></tbody>
   </table>
 </div>
 
@@ -551,23 +608,25 @@ function signedCellClass(n) { return n == null ? '' : (Number(n) >= 0 ? 'pos' : 
 
 async function refresh() {
   try {
-    const [portRes, ordersRes, tradesRes, signalsRes] = await Promise.all([
+    const [portRes, ordersRes, tradesRes, signalsRes, spreadRes] = await Promise.all([
       fetch('/api/portfolio'),
       fetch('/api/orders'),
       fetch('/api/trades'),
       fetch('/api/signals'),
+      fetch('/api/spread_status'),
     ]);
     const port = await portRes.json();
     const orders = await ordersRes.json();
     const tradesData = await tradesRes.json();
     const signals = await signalsRes.json();
-    render(port, orders, tradesData, signals);
+    const spreadStatus = await spreadRes.json();
+    render(port, orders, tradesData, signals, spreadStatus);
   } catch(e) {
     console.error(e);
   }
 }
 
-function render(port, orders, tradesData, signals) {
+function render(port, orders, tradesData, signals, spreadStatus) {
   const summary = tradesData.summary || {};
   const trades = tradesData.trades || [];
   const positions = port.positions || [];
@@ -629,12 +688,15 @@ function render(port, orders, tradesData, signals) {
     const time = t.logged_at ? t.logged_at.slice(0,19).replace('T',' ') : '—';
     const label = t.reason || t.status || '—';
     const rc = label==='stop' ? 'reason-stop' : label==='target_resting' || label==='filled' ? 'reason-target' : 'reason-eod';
+    const nb = t.net_bps != null ? (Number(t.net_bps) >= 0 ? '+' : '') + fmt(t.net_bps, 1) : '—';
+    const nbClass = t.net_bps != null ? (Number(t.net_bps) >= 0 ? 'pos' : 'neg') : '';
     return `<tr>
       <td>${time}</td>
       <td>${t.symbol}</td>
       <td class="${t.side==='BUY'?'side-buy':'side-sell'}">${t.side}</td>
       <td class="${rc}">${label}</td>
-      <td>${t.price != null ? fmt(t.price,6) : '—'}</td>
+      <td>${t.price != null ? fmt(t.price,8) : '—'}</td>
+      <td class="${nbClass}">${nb}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="5" style="color:#444">No trades yet</td></tr>';
 
@@ -665,6 +727,25 @@ function render(port, orders, tradesData, signals) {
       <td style="color:#555">${s.block_reason ?? ''}</td>
     </tr>`;
   }).join('') || '<tr><td colspan="9" style="color:#444">Loading...</td></tr>';
+
+  // Spread bot status
+  const sbots = (spreadStatus && spreadStatus.bots) || [];
+  const spreadBody = document.getElementById('spread-body');
+  spreadBody.innerHTML = sbots.length ? sbots.map(b => {
+    const statusColor = b.status === 'IN_POSITION' ? 'pos' : b.status === 'BUYING' ? 'reason-eod' : '';
+    const cum = b.cum_net_bps != null ? (b.cum_net_bps >= 0 ? '+' : '') + Number(b.cum_net_bps).toFixed(1) : '—';
+    const cumClass = b.cum_net_bps >= 0 ? 'pos' : 'neg';
+    return `<tr>
+      <td style="color:#666">${b._file || '—'}</td>
+      <td class="${statusColor}">${b.status || '—'}</td>
+      <td>${b.buy_price ? 'PEPE/USD' : '—'}</td>
+      <td>${b.buy_price ? '$'+fmt(b.buy_price, 8) : '—'}</td>
+      <td>${b.sell_price ? '$'+fmt(b.sell_price, 8) : '—'}</td>
+      <td>${b.qty ? Number(b.qty).toLocaleString() : '—'}</td>
+      <td class="${cumClass}">${cum} bps</td>
+      <td>${b.trade_num ?? '—'}</td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="8" style="color:#444">No state files found</td></tr>';
 
   document.getElementById('last-updated').textContent = 'Last updated: ' + new Date().toISOString().replace('T',' ').slice(0,19) + ' UTC';
 }
