@@ -2,115 +2,101 @@
 
 ## Overview
 
-Apex is a confirmed intraday breakout strategy executed across five liquid crypto assets
-on the Roostoo spot competition account. It is long-only, spot-only, and targets a
-single source of edge: price breaking above the prior 24-hour high with confirmation,
-in a trending market regime.
-
-The strategy was developed through iterative backtesting after rejecting an asymmetric
-grid approach that was structurally broken due to an inverted risk-reward ratio.
-
----
-
-## What We Rejected First
-
-Before landing on Apex, we backtested an asymmetric intraday grid strategy:
-
-- Daily anchor = UTC day open
-- Three limit buy ladders below anchor at -0.5%, -1.0%, -1.5%
-- Pre-paired TP sells at anchor, anchor-0.3%, anchor-0.5%
-- Hard stop at -3.5% from anchor
-
-**Result: -14.19% equal-weight across 12 symbols, 1/12 positive.**
-
-The reason was structural: TP hits produced ~60 bps profit, but stop hits produced
-~2,700 bps loss. With a 78% TP rate and 20% stop rate, EV per trade was -493 bps.
-No filter or parameter change could fix an inverted R:R.
-
----
-
-## The Apex Edge
-
-The core observation: assets that break above their prior 24-hour high with a confirmed
-bar close (not just a wick) tend to continue in that direction intraday.
-
-Breakouts confirmed by a closing price above the rolling high have a materially lower
-false breakout rate than wick-only entries. This single filter — requiring the bar
-**close** to exceed the rolling high — flipped the strategy from deeply negative to
-consistently profitable across the tested universe.
+88th Meridian is a confirmed intraday breakout strategy executed across five liquid crypto
+assets on the Roostoo spot competition account. It is long-only, spot-only, and targets a
+single source of edge: price breaking above the prior 24-hour high with confirmation and
+genuine participation, in a trending market regime.
 
 ---
 
 ## Signal Logic
 
-**Timeframe:** 5-minute bars from Binance REST klines.
+**Timeframe:** 5-minute bars fetched from Binance REST klines at runtime.
 
-**Rolling high:** Maximum high across the prior 288 completed bars (24 hours of 5m bars),
+**Rolling high:** Maximum high across the prior 288 completed 5m bars (24 hours),
 excluding the signal bar itself.
 
-**Entry condition:** The last completed 5m bar closes at or above the rolling high.
+**Entry requires all three conditions to be true simultaneously:**
 
-**Regime gate:** Entry is skipped if the asset's close is at or below its 20-day EMA.
-The EMA is computed from 480 × 1h bars (20 days) to ensure full convergence in a single
-API call at runtime. This prevents entries in sustained downtrends.
+1. **Close confirmation** — the last completed 5m bar closes at or above the rolling high.
+   A wick touch alone does not trigger. This is the most important filter: requiring the
+   bar *close* to exceed the rolling high materially reduces false breakouts.
+
+2. **Volume confirmation** — the breakout bar's volume must be at least 1.5× the 20-bar
+   trailing average volume. Low-volume breakouts are disproportionately fakeouts in
+   ranging, thin markets.
+
+3. **Regime gate** — the asset's close must be above its 20-day EMA, computed from
+   480 × 1h bars (EWM span=480). This skips entries during sustained downtrends.
+   Using hourly bars ensures the EMA is fully warmed up in a single API call at runtime.
 
 ---
 
 ## Trade Structure
 
-All levels are anchored to `rolling_high`, not the entry fill price. This ensures the
-live risk-reward matches what was backtested regardless of entry slippage.
+All levels are anchored to `rolling_high`, not the entry fill price. This means the
+live risk-reward matches the backtest regardless of how far above rolling high price
+is trading at the moment the signal is detected.
 
-| Level | Calculation | Value |
-|-------|-------------|-------|
-| Entry | Current market price (limit order at time of signal) | — |
-| Stop | `rolling_high × (1 − 100 bps)` | −1% from rolling high |
-| Target | `rolling_high × (1 + 300 bps)` | +3% from rolling high |
-| EOD exit | Any open position at midnight UTC closes at current price | — |
+| Level | Calculation |
+|---|---|
+| Entry | Current Roostoo ticker price (limit order, fills immediately) |
+| Stop | `rolling_high × (1 − 0.0100)` — 100 bps below rolling high |
+| Target | `rolling_high × (1 + 0.0300)` — 300 bps above rolling high |
+| EOD exit | Any open position at midnight UTC closes at current market price |
 
-**Risk-reward: 3:1** (target 300 bps, stop 100 bps).
+**Risk-reward: 3:1.** Break-even win rate at 3:1 is 25%. The strategy runs at 40–44%.
+
+The target is placed as a resting limit sell order immediately after the entry fill.
+Roostoo fills it automatically when price touches the target level — no additional bot
+action is needed.
 
 ---
 
 ## Symbol Universe
 
-Five symbols were selected after testing the full 66-asset Roostoo competition universe
-under realistic entry assumptions (bar close entry, rolling high anchored stop/target,
-10 bps round-trip fees, regime gate active).
+Five symbols selected from the Roostoo competition universe after backtesting under
+the realistic entry model (bar-close entry, rolling-high anchor, 10 bps round-trip fees,
+regime gate active, 14 months of data):
 
-| Symbol | Backtest Return | Win Rate | Mean Net P&L |
-|--------|----------------|----------|--------------|
+| Symbol | Return | Win Rate | Mean Net |
+|---|---|---|---|
 | FLOKIUSDT | +56.87% | 44% | +22.7 bps/trade |
 | DOGEUSDT | +33.54% | 43% | +15.5 bps/trade |
 | AVAXUSDT | +31.90% | 40% | +13.8 bps/trade |
 | FETUSDT | +22.87% | 40% | +10.3 bps/trade |
 | VIRTUALUSDT | +7.87% | 42% | +4.7 bps/trade |
 
-**Equal-weight portfolio: +30.61% over 14 months (Jan 2025 – Feb 2026), 5/5 positive.**
+**Equal-weight: +30.61% over 14 months (Jan 2025 – Feb 2026), 5/5 positive.**
 
 Selection criteria: positive return under the realistic entry model, sufficient trade
-frequency, and confirmed edge with both the confirmation bar filter and regime gate active.
+frequency (no symbols with fewer than ~20 trades in 14 months), and edge confirmed with
+both the confirmation bar filter and regime gate active.
 
 ---
 
 ## Fee Model
 
-All backtest and live numbers use limit orders only.
+All orders are placed as limit orders to pay the maker/taker rate, not the market order rate.
 
 | Order type | Fee per side | Round-trip |
-|------------|-------------|------------|
+|---|---|---|
 | Limit | 5 bps | 10 bps |
 
-Market orders (20 bps round-trip) were explicitly rejected after verifying that the edge
-does not survive the higher fee load.
+The strategy does not survive market order fees (20 bps round-trip). All backtesting
+and live execution uses limit orders only.
 
 ---
 
 ## Position Sizing
 
-Capital is split equally across all five symbols: 20% per slot. Allocation is computed
-from total portfolio equity (cash + open positions marked to market) at the start of each
-poll cycle.
+Capital is split equally across all five symbols: 20% per slot.
 
-One position per symbol at a time. A symbol cannot enter a new trade while it has an
-active position.
+```
+allocation_usd = total_equity / 5
+qty = floor(min(allocation_usd, free_usd_balance) / current_price)
+```
+
+One position per symbol at a time. A symbol cannot enter a new trade while it carries
+an active position. Equity is computed from live Roostoo balances (cash + positions
+marked to Roostoo ticker prices) at the start of each poll cycle.
