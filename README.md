@@ -70,21 +70,6 @@ ROOSTOO_COMPETITION_API_SECRET=your_secret
 
 ---
 
-## Deployment
-
-```bash
-# Persistent systemd service (AWS EC2)
-sudo systemctl start 88meridian-spread
-
-# Follow live output
-sudo journalctl -fu 88meridian-spread
-```
-
-See [src/docs/SPREAD.md](src/docs/SPREAD.md) for full deployment guide, state schema,
-and log format.
-
----
-
 ## Docs
 
 | Doc | Contents |
